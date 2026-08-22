@@ -1,0 +1,38 @@
+# Python caches and environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# IDE and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Third-party source and large model assets
+sherpa-ncnn/
+zhipuai_rag/weights/
+zhipuai_rag/RAG/
+*.pt
+*.pth
+*.bin
+*.onnx
+*.engine
+
+# Generated vector databases and runtime output
+zhipuai_rag/dataset/chroma_db/
+*.pcm
+*.wav
+person_detected.png
+liyifeng.png
+
+# Local documents and office temporary files
+*.docx
+~$*

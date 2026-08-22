@@ -1,0 +1,15 @@
+chromadb==0.5.13
+langchain==0.3.3
+langchain_community==0.3.2
+PyAudio==0.2.14
+pydub==0.25.1
+PyQt5==5.15.11
+PyQt5_sip==12.15.0
+Requests==2.32.3
+torch==2.0.0+cu118
+transformers==4.45.2
+zhipuai==2.1.5.20230904
+faiss-cpu>=1.7.0
+rank_bm25==0.2.2
+langchain-huggingface>=0.1.0
+sentence-transformers>=3.0.0
