@@ -1,195 +1,201 @@
 # Sell-RAG
 
-面向智能无人售卖场景的多模态检索增强交互原型，集成人员检测、视觉理解、知识库检索、商品问答、语音交互和桌面界面。
+面向单机智能售卖终端的多模态检索增强生成系统。项目将文档版本管理、结构化商品库、混合检索、有引用回答、语音交互和人员存在检测拆分为独立服务，并提供 FastAPI、CLI 与 PyQt 双视图客户端。
 
-> 本项目为研究与原型代码。仓库仅保存核心源码，不包含模型权重、向量数据库、运行产物或任何真实 API 密钥。
+> 默认以 Fake 模式运行，不需要 API 密钥或大型模型即可完成开发、演示和自动化测试。生产模式使用智谱生成/视觉、百度 ASR/TTS、本地 BGE Embedding 与 Cross-Encoder。
 
-## 项目概览
-
-Sell-RAG 通过摄像头感知用户，结合视觉模型提取图像信息，并使用检索增强生成（Retrieval-Augmented Generation, RAG）从商品资料中检索上下文，最终由大语言模型生成自然语言回答或商品推荐。系统同时支持麦克风输入、语音合成输出和 PyQt5 桌面对话界面。
+## Architecture
 
 ```mermaid
 flowchart LR
-    A[摄像头 / 麦克风] --> B[YOLOv5 人员检测]
-    B --> C[智谱视觉模型]
-    A --> D[百度语音识别]
-    C --> E[用户特征与问题]
-    D --> E
-    F[商品文档] --> G[Embedding 与 Chroma]
-    G --> H[相关知识检索]
-    E --> I[大语言模型]
-    H --> I
-    I --> J[文本回答]
-    I --> K[语音合成]
+    subgraph Offline[离线链路]
+        A[PDF/DOCX/XLSX/图片] --> B[校验与版本管理]
+        B --> C[Docling/OCR/结构化解析]
+        C --> D[父子切片与商品记录]
+        D --> E[角色隔离索引]
+        E --> F[(SQLite + FAISS)]
+    end
+    subgraph Online[在线链路]
+        G[文本/语音] --> H[查询路由与字段提取]
+        H --> I[SQLite精确查询]
+        H --> J[Dense + BM25]
+        J --> K[RRF + Cross-Encoder]
+        I --> L[证据组装]
+        K --> L
+        L --> M[有引用回答/拒答]
+        M --> N[流式界面与TTS]
+    end
 ```
 
-## 核心功能
+离线摄取在新索引验证完成后原子切换，因此上传或回滚文档不会让在线问答读取半成品索引。
 
-- **人员检测**：使用 YOLOv5 对摄像头画面进行实时检测，并在满足阈值条件时截取图像。
-- **视觉理解**：调用智谱 AI 视觉模型分析图像内容，为后续对话提供上下文。
-- **RAG 问答**：加载 DOCX、PDF 或 XLSX 文档，通过本地 Embedding 模型与 Chroma 建立和查询知识库。
-- **商品推荐**：结合检索结果、对话历史和用户问题生成自然语言推荐。
-- **语音交互**：通过百度语音接口完成中文语音识别和语音合成。
-- **桌面界面**：提供基于 PyQt5 的文本输入、语音输入和知识库选择界面。
-- **模块化示例**：`C8` 目录提供数据准备、索引构建、检索优化与生成集成的拆分实现。
+## Features
 
-## 技术栈
+- PDF、扫描 PDF、DOCX、XLSX、CSV、JSON、Markdown、文本和图片接入。
+- 文件签名、大小、压缩规模与路径安全检查，SHA-256 去重和增量版本管理。
+- Docling 优先解析，保留页码、版面、表格和图片元数据；轻量环境自动使用显式回退解析器。
+- XLSX 商品行进入 SQLite，价格、库存和 SKU 不依赖向量相似度判断。
+- 300/900 Token 父子切片，12% 子块重叠，不跨越商品、章节或表格边界。
+- BGE Dense + 中文 BM25 + RRF + Cross-Encoder；模型不可用时降级但不会伪造健康状态。
+- `guest`、`operator`、`admin` 角色隔离，文档和结构化商品均执行 ACL。
+- 引用白名单校验、无证据拒答、未知商品拒答和提示注入内容隔离。
+- 百度 ASR/TTS、WebRTC VAD、热词纠错、低置信确认、分句播放和 barge-in。
+- 摄像头仅检测人员是否出现；5/8 帧防抖和 30 秒冷却，不保存画面，不推断身份或人口属性。
+- 内置检索、引用、拒答、解析和延迟评测指标。
 
-| 模块 | 主要技术 |
-| --- | --- |
-| 目标检测 | YOLOv5、PyTorch、OpenCV |
-| 视觉与对话模型 | 智谱 AI |
-| 文档处理 | LangChain、Docx2txt、PyPDF |
-| 向量检索 | Chroma、Xiaobu Embedding |
-| 语音交互 | 百度语音 API、PyAudio、Pydub |
-| 桌面界面 | PyQt5 |
-| 扩展示例 | Moonshot API |
-
-## 项目结构
+## Project Layout
 
 ```text
-sell-rag/
-├── .env.example                         # 环境变量示例
-├── .gitignore                           # 模型、密钥及运行产物忽略规则
-├── README.md
-└── zhipuai_rag/
-    ├── main.py                          # PyQt5 对话界面入口
-    ├── sell.py                          # 摄像头、视觉分析和语音对话主流程
-    ├── detect.py                        # 独立人员检测示例
-    ├── audio.py                         # 录音、语音识别与语音合成
-    ├── rag.py                           # 文档加载、向量检索与模型问答
-    ├── tokenizer.py                     # Xiaobu Embedding 封装
-    ├── add_files.py                     # 知识库文件添加工具
-    ├── rag_data_preprocessor.py         # RAG 数据预处理
-    ├── rag_vector_retriever.py          # RAG 向量检索器
-    ├── requirements.txt
-    └── C8/                              # 模块化 RAG 实现示例
+configs/default.yaml          运行参数，不保存密钥
+src/sell_rag/
+├── domain/                   Pydantic 数据契约
+├── ingestion/                校验、解析、切片与版本摄取
+├── storage/                  SQLite 数据层
+├── indexing/                 Embedding、FAISS、BM25 和索引版本
+├── retrieval/                路由、过滤、RRF、重排和证据组装
+├── generation/               智谱/Fake 适配器与引用回答
+├── multimodal/               百度语音、VAD、TTS 和人员存在检测
+├── api/                      FastAPI 工厂与版本化接口
+├── ui/                       PyQt 用户/管理双视图
+├── evaluation/               离线回归评测
+├── observability/            JSON 日志与耗时追踪
+├── settings.py
+└── cli.py
+tests/                        单元、集成、夹具与评测数据
+runtime/                      文档、SQLite、索引和日志；不提交 Git
 ```
 
-以下内容不会提交到仓库：
-
-```text
-sherpa-ncnn/                             # 第三方项目源码
-zhipuai_rag/weights/                     # YOLOv5 权重
-zhipuai_rag/RAG/                         # Embedding 模型
-zhipuai_rag/dataset/chroma_db/           # Chroma 向量数据库
-*.pcm、*.wav、截图、缓存及本地文档
-```
-
-## 环境要求
+## Requirements
 
 - Windows 10/11
-- Python 3.9（推荐）
-- 摄像头和麦克风（运行完整交互流程时需要）
-- 可访问智谱 AI、百度语音等外部服务的网络环境
-- NVIDIA GPU 与 CUDA 11.8（可选，用于 GPU 推理）
+- Python 3.11
+- 完整终端功能需要摄像头和麦克风
+- BGE 与 Reranker 使用 GPU 时建议 NVIDIA GPU 及匹配的 PyTorch/CUDA
 
-`requirements.txt` 中的 PyTorch 版本面向 CUDA 11.8。CPU 环境或其他 CUDA 版本请先根据 [PyTorch 官方安装说明](https://pytorch.org/get-started/locally/) 安装匹配的 PyTorch，再安装其余依赖。
-
-## 快速开始
-
-### 1. 克隆仓库
+## Installation
 
 ```powershell
 git clone https://github.com/Deng50/sell-rag.git
-cd sell-rag\zhipuai_rag
-```
+cd sell-rag
 
-### 2. 创建虚拟环境
-
-```powershell
-python -m venv .venv
+py -3.11 -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+pip install -e .
 ```
 
-安装 `PyAudio` 失败时，需要使用与 Python 版本和系统架构匹配的预编译 wheel，或先安装所需的 PortAudio 开发组件。
-
-### 3. 配置 API 密钥
-
-程序从操作系统环境变量读取凭据，不会自动加载 `.env` 文件。PowerShell 示例：
+按需安装可选能力：
 
 ```powershell
-$env:ZHIPUAI_API_KEY="你的智谱 AI API Key"
+pip install -e ".[document,retrieval]"  # Docling、OCR、BGE、FAISS、重排
+pip install -e ".[audio,vision,ui]"     # 语音、摄像头、PyQt
+pip install -e ".[dev,eval]"            # 测试和评测
+```
+
+核心依赖的可复现版本位于 `requirements.lock`：
+
+```powershell
+pip install -r requirements.lock
+pip install -e . --no-deps
+```
+
+PyTorch 应根据设备从官方渠道安装匹配的 CPU 或 CUDA wheel，不在锁文件中强制单一 CUDA 版本。
+
+## Configuration
+
+运行参数位于 `configs/default.yaml`，密钥只从环境变量读取：
+
+```powershell
+$env:SELL_RAG_FAKE_PROVIDERS="true"
+$env:SELL_RAG_ADMIN_TOKEN="请设置高强度管理员令牌"
+$env:SELL_RAG_OPERATOR_TOKEN="请设置操作员令牌"
+```
+
+启用真实服务：
+
+```powershell
+$env:SELL_RAG_FAKE_PROVIDERS="false"
+$env:ZHIPUAI_API_KEY="你的智谱 API Key"
 $env:BAIDU_API_KEY="你的百度语音 API Key"
 $env:BAIDU_SECRET_KEY="你的百度语音 Secret Key"
-$env:MOONSHOT_API_KEY="你的 Moonshot API Key"
+$env:SELL_RAG_DEVICE="cuda"
 ```
 
-| 环境变量 | 用途 | 是否必需 |
+## Quick Start
+
+启动本地服务：
+
+```powershell
+sell-rag serve
+```
+
+访问 API 文档：<http://127.0.0.1:8765/docs>
+
+另开终端启动 PyQt 客户端：
+
+```powershell
+sell-rag ui
+```
+
+摄取文档并原子重建索引：
+
+```powershell
+sell-rag ingest .\data\商品目录.xlsx
+sell-rag ingest .\data\校史资料.pdf --acl guest,operator,admin
+```
+
+常用管理命令：
+
+```powershell
+sell-rag reindex
+sell-rag rollback DOCUMENT_ID VERSION
+sell-rag migrate-legacy .\zhipuai_rag\dataset\chroma_db
+sell-rag evaluate .\tests\fixtures\evaluation.jsonl
+```
+
+## API
+
+| Method | Endpoint | Description |
 | --- | --- | --- |
-| `ZHIPUAI_API_KEY` | 主流程中的视觉分析与对话生成 | 主程序必需 |
-| `BAIDU_API_KEY` | 百度语音服务身份验证 | 使用语音功能时必需 |
-| `BAIDU_SECRET_KEY` | 百度语音服务身份验证 | 使用语音功能时必需 |
-| `MOONSHOT_API_KEY` | `C8` 模块化示例 | 仅运行 C8 时必需 |
+| `POST` | `/v1/query` | 同步结构化问答 |
+| `POST` | `/v1/query/stream` | SSE 回答、引用与完成事件 |
+| `POST` | `/v1/documents` | 上传并异步解析、索引 |
+| `GET` | `/v1/documents` | 文档版本、ACL 和状态 |
+| `POST` | `/v1/documents/{id}/versions/{version}/activate` | 激活历史版本 |
+| `DELETE` | `/v1/documents/{id}` | 软删除并更新索引 |
+| `GET` | `/v1/jobs/{id}` | 后台任务状态 |
+| `GET/POST` | `/v1/products` | 商品精确查询与维护 |
+| `POST` | `/v1/speech/transcribe` | PCM 语音识别 |
+| `POST` | `/v1/speech/synthesize` | WAV 语音合成 |
+| `POST` | `/v1/feedback` | 用户反馈 |
+| `POST` | `/v1/evaluations` | 运行回归评测 |
+| `GET` | `/health`, `/ready` | 依赖状态与就绪检查 |
 
-仓库根目录的 `.env.example` 仅用于展示变量名称，不应填写并提交真实密钥。
-
-### 4. 准备模型与知识库
-
-模型文件体积较大，需要自行下载并放置到以下目录：
-
-```text
-zhipuai_rag/
-├── weights/
-│   └── yolov5s.pt
-└── RAG/
-    └── xiaobu-embedding-v2/
-```
-
-准备商品文档后，可运行 `add_files.py` 或数据预处理脚本构建知识库。Chroma 数据默认写入：
+管理请求需要角色和令牌：
 
 ```text
-zhipuai_rag/dataset/chroma_db/
+X-Role: operator
+Authorization: Bearer <SELL_RAG_OPERATOR_TOKEN>
 ```
 
-模型、原始业务文档和生成的向量数据库均已被 `.gitignore` 排除。
+请求体中的角色不会用于提权，服务只信任认证头解析出的角色。
 
-## 运行项目
-
-项目当前使用相对路径，执行命令前应确保工作目录为 `zhipuai_rag`。
-
-启动完整的摄像头与语音交互流程：
+## Testing
 
 ```powershell
-python sell.py
+pytest
 ```
 
-启动 PyQt5 桌面对话界面：
+默认测试不访问云 API，也不下载模型。`live` 标记专用于真实服务和模型验证。内置评测集仅用于回归，不能代表真实业务准确率；生产指标必须基于人工标注数据报告。
 
-```powershell
-python main.py
-```
+## Security And Privacy
 
-仅运行人员检测示例：
+- `runtime/`、模型、索引、音频、图片和 `.env` 均被 Git 忽略。
+- 疑似提示注入内容保留供管理员复核，但默认不进入检索索引。
+- 摄像头帧只在内存中处理，不做持久化、人脸识别、年龄、性别或情绪推断。
+- 如果密钥曾经进入 Git 历史，应先撤销密钥，再使用历史清理工具处理；删除当前源码中的字符串并不足够。
+- 正式部署应使用高强度令牌、限制本机端口访问并保护 `runtime/` 目录权限。
 
-```powershell
-python detect.py
-```
+## License
 
-运行模块化 RAG 示例：
-
-```powershell
-cd C8
-pip install -r requirements.txt
-python main.py
-```
-
-## 安全与隐私
-
-- 禁止将真实 API 密钥写入源码、`.env.example` 或 Git 提交记录。
-- 如果密钥曾进入提交历史，仅删除当前文件中的密钥并不充分；应立即撤销旧密钥，并使用历史清理工具删除相关提交内容。
-- 摄像头图像和人物特征分析可能涉及个人隐私，应在取得明确授权并遵守适用法律的前提下使用。
-- 生产部署前应补充输入校验、异常处理、访问控制、日志脱敏、自动化测试及服务限流。
-
-## 已知限制
-
-- 部分模块依赖本地模型和既有 Chroma 数据，首次运行前必须准备相关资源。
-- 若干脚本使用相对路径，应从 `zhipuai_rag` 目录启动。
-- 完整流程依赖摄像头、麦克风、音频驱动以及多个外部 API。
-- 当前代码主要用于原型验证，尚未提供统一配置层、安装包或自动化测试。
-
-## 许可证
-
-本项目当前未提供开源许可证。在作者明确添加许可证前，请勿假定该代码可被复制、修改或用于商业分发。
+当前仓库尚未提供开源许可证。在作者明确添加许可证前，请勿假定代码可被复制、修改或用于商业分发。

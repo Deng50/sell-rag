@@ -27,6 +27,7 @@ zhipuai_rag/RAG/
 *.engine
 
 # Generated vector databases and runtime output
+runtime/
 zhipuai_rag/dataset/chroma_db/
 *.pcm
 *.wav
@@ -36,3 +37,12 @@ liyifeng.png
 # Local documents and office temporary files
 *.docx
 ~$*
+
+# Test and tool caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/

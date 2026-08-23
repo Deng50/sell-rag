@@ -1,0 +1,13 @@
+# Core runtime lock for Python 3.11. Optional model/hardware dependencies are
+# managed through pyproject extras because their wheels depend on CUDA and OS.
+fastapi==0.115.5
+httpx==0.27.2
+jieba==0.42.1
+numpy==1.26.4
+openpyxl==3.1.5
+pydantic==2.9.2
+python-multipart==0.0.17
+PyYAML==6.0.2
+typer==0.13.1
+uvicorn==0.32.1
+zhipuai==2.1.5.20230904

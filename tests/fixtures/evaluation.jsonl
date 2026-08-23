@@ -1,0 +1,3 @@
+{"query":"清泉饮用水多少钱","expected_facts":["2.00","库存 20"],"should_refuse":false,"relevant_document_ids":[]}
+{"query":"北洋大学堂创建于哪一年","expected_facts":["1895"],"should_refuse":false,"relevant_document_ids":[]}
+{"query":"数据库里没有的火星商品价格","expected_facts":[],"should_refuse":true,"relevant_document_ids":[]}

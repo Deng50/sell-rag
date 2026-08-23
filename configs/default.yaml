@@ -1,0 +1,28 @@
+app:
+  host: 127.0.0.1
+  port: 8765
+  fake_providers: true
+storage:
+  runtime_dir: runtime
+  database: runtime/sell_rag.sqlite3
+  documents_dir: runtime/documents
+  indexes_dir: runtime/indexes
+ingestion:
+  max_file_mb: 50
+  child_tokens: 300
+  parent_tokens: 900
+  overlap_ratio: 0.12
+retrieval:
+  embedding_model: BAAI/bge-small-zh-v1.5
+  reranker_model: BAAI/bge-reranker-v2-m3
+  dense_top_k: 24
+  lexical_top_k: 24
+  final_top_k: 8
+  rrf_k: 60
+  max_context_tokens: 3200
+multimodal:
+  asr_confirm_threshold: 0.65
+  presence_window: 8
+  presence_hits: 5
+  presence_cooldown_seconds: 30
+
