@@ -68,8 +68,9 @@ class RetrievalService:
         budget = self.settings.max_context_tokens * 2
         used = 0
         for hit in hits:
-            source = self.database.get_chunk(hit.chunk.parent_id, role) if hit.chunk.parent_id else hit.chunk
-            source = source or hit.chunk
+            source = self.database.get_chunk(hit.chunk.parent_id or hit.chunk.chunk_id, role)
+            if source is None or source.prompt_injection:
+                continue
             if source.chunk_id in seen:
                 continue
             seen.add(source.chunk_id)

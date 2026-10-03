@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import time
+import threading
 from collections import Counter
 from pathlib import Path
 from typing import Protocol
@@ -103,6 +104,8 @@ class CrossEncoderReranker:
 
 class RoleIndex:
     def __init__(self, chunks: list[Chunk], vectors: np.ndarray):
+        if vectors.ndim != 2 or len(vectors) != len(chunks) or not np.isfinite(vectors).all():
+            raise ValueError("索引向量和文档块不一致")
         self.chunks = chunks
         self.vectors = vectors.astype(np.float32)
         self.tokens = [tokenize(chunk.text) for chunk in chunks]
@@ -154,6 +157,7 @@ class IndexManager:
         self.reranker = reranker or self._reranker()
         self.indexes: dict[Role, RoleIndex] = {}
         self.version: str | None = None
+        self._lock = threading.RLock()
 
     def _embedding(self) -> EmbeddingProvider:
         if not self.settings.fake_providers:
@@ -178,6 +182,10 @@ class IndexManager:
         return OverlapReranker()
 
     def build(self) -> dict[str, object]:
+        with self._lock:
+            return self._build()
+
+    def _build(self) -> dict[str, object]:
         version = time.strftime("%Y%m%d_%H%M%S") + "_" + hashlib.sha256(os.urandom(8)).hexdigest()[:8]
         staging = self.settings.indexes_dir / f".{version}.staging"
         target = self.settings.indexes_dir / version
@@ -205,7 +213,7 @@ class IndexManager:
                 })
         (staging / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         staging.replace(target)
-        active_tmp = self.settings.indexes_dir / ".active.tmp"
+        active_tmp = self.settings.indexes_dir / f".{version}.active.tmp"
         active_tmp.write_text(version, encoding="utf-8")
         active_tmp.replace(self.settings.indexes_dir / "ACTIVE")
         self.database.save_index_version(version, manifest, True)
@@ -234,19 +242,30 @@ class IndexManager:
         return np.vstack(vectors).astype(np.float32)
 
     def ensure_loaded(self) -> None:
-        if self.indexes:
-            return
-        active = self.settings.indexes_dir / "ACTIVE"
-        if not active.exists():
+        with self._lock:
+            self._ensure_loaded()
+
+    def _ensure_loaded(self) -> None:
+        # SQLite is the publication point shared with CLI and other API processes.
+        active = self.database.active_index()
+        if not active:
             self.build()
             return
-        version = active.read_text(encoding="utf-8").strip()
+        version = active["index_version"]
+        if self.indexes and self.version == version:
+            return
+        if not re.fullmatch(r"\d{8}_\d{6}_[a-f0-9]{8}", version):
+            self.build()
+            return
         directory = self.settings.indexes_dir / version
         indexes: dict[Role, RoleIndex] = {}
         try:
+            manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+            if manifest.get("embedding_model") != self.embedding.name:
+                raise ValueError("索引的 Embedding 模型已改变")
             for role in Role:
                 chunks = [Chunk.model_validate(item) for item in json.loads((directory / f"{role.value}.json").read_text(encoding="utf-8"))]
-                vectors = np.load(directory / f"{role.value}.npy")
+                vectors = np.load(directory / f"{role.value}.npy", allow_pickle=False)
                 indexes[role] = RoleIndex(chunks, vectors)
         except (OSError, ValueError, json.JSONDecodeError):
             self.build()
@@ -254,8 +273,12 @@ class IndexManager:
         self.indexes, self.version = indexes, version
 
     def search(self, query: str, role: Role, top_k: int | None = None) -> list[SearchHit]:
-        self.ensure_loaded()
-        index = self.indexes[role]
+        with self._lock:
+            self._ensure_loaded()
+            index = self.indexes[role]
+        # Revocation/deletion takes effect even while a replacement index is being built.
+        permitted = {chunk.chunk_id for chunk in self.database.active_chunks(role)
+                     if not chunk.prompt_injection}
         dense = index.dense(self.embedding.encode_query(query), self.settings.dense_top_k)
         lexical = index.lexical(query, self.settings.lexical_top_k)
         scores: dict[int, float] = {}
@@ -267,11 +290,18 @@ class IndexManager:
             scores[item_index] = scores.get(item_index, 0) + 1 / (self.settings.rrf_k + position)
             dense_rank, _ = ranks.get(item_index, (None, None))
             ranks[item_index] = (dense_rank, position)
-        candidates = sorted(scores, key=scores.get, reverse=True)[:30]
+        candidates = [i for i in sorted(scores, key=scores.get, reverse=True)
+                      if index.chunks[i].chunk_id in permitted][:30]
         rerank_scores = self.reranker.score(query, [index.chunks[i].text for i in candidates]) if candidates else []
         ordered = sorted(zip(candidates, rerank_scores), key=lambda item: (item[1], scores[item[0]]), reverse=True)
         result = []
-        for item_index, rerank_score in ordered[: top_k or self.settings.final_top_k]:
+        limit = self.settings.final_top_k if top_k is None else max(0, top_k)
+        for item_index, rerank_score in ordered:
+            # The deterministic fallback has no semantic evidence when overlap is zero.
+            if isinstance(self.reranker, OverlapReranker) and rerank_score <= 0:
+                continue
+            if len(result) >= limit:
+                break
             dense_rank, lexical_rank = ranks[item_index]
             result.append(SearchHit(
                 chunk=index.chunks[item_index], score=scores[item_index], dense_rank=dense_rank,

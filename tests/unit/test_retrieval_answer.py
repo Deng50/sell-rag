@@ -77,3 +77,51 @@ def test_product_comparison_uses_structured_prices(services) -> None:
     assert "清泉饮用水 价格最低" in answer.answer
     assert "37.00 元" in answer.answer
     assert len(answer.citations) == 2
+
+
+def test_existing_service_reloads_indexes_published_by_another_process(services, tmp_path) -> None:
+    from sell_rag.indexing import IndexManager
+
+    services.index.build()
+    source = tmp_path / "new.md"
+    source.write_text("鲸鱼生活在海洋里", encoding="utf-8")
+    services.ingestion.ingest(source)
+    other = IndexManager(services.settings, services.database)
+    other.build()
+    assert services.index.search("鲸鱼", Role.GUEST)
+    assert services.index.version == other.version
+
+
+def test_deletion_and_acl_change_revoke_hits_before_reindex(services, tmp_path) -> None:
+    source = tmp_path / "private.md"
+    source.write_text("秘密折扣代码 PRIVATE", encoding="utf-8")
+    result = services.ingestion.ingest(source)
+    services.index.build()
+    assert services.index.search("秘密折扣", Role.GUEST)
+    services.ingestion.ingest(source, acl=[Role.ADMIN])
+    assert services.index.search("秘密折扣", Role.GUEST) == []
+    services.index.build()
+    services.database.soft_delete_document(result["document"]["document_id"])
+    assert services.index.search("秘密折扣", Role.ADMIN) == []
+
+
+def test_unrelated_knowledge_query_refuses_with_populated_index(services, tmp_path) -> None:
+    source = tmp_path / "water.md"
+    source.write_text("鲸鱼生活在海洋里", encoding="utf-8")
+    services.ingestion.ingest(source)
+    services.index.build()
+    assert services.answer.answer(QueryRequest(query="火星基地何时建成")).refused
+
+
+def test_changed_embedding_model_rebuilds_persisted_index(services, tmp_path) -> None:
+    from sell_rag.indexing import HashEmbedding, IndexManager
+
+    source = tmp_path / "model.md"
+    source.write_text("鲸鱼生活在海洋里", encoding="utf-8")
+    services.ingestion.ingest(source)
+    services.index.build()
+    replacement = HashEmbedding(dimensions=32)
+    replacement.name = "hash-test-32"
+    index = IndexManager(services.settings, services.database, embedding=replacement)
+    assert index.search("鲸鱼", Role.GUEST)
+    assert index.version != services.index.version

@@ -286,7 +286,13 @@ class Database:
 
     def get_chunk(self, chunk_id: str, role: Role) -> Chunk | None:
         with self.connect() as db:
-            row = db.execute("SELECT payload_json FROM chunks WHERE chunk_id=?", (chunk_id,)).fetchone()
+            row = db.execute(
+                "SELECT c.payload_json FROM chunks c JOIN document_versions v "
+                "ON c.document_id=v.document_id AND c.document_version=v.version "
+                "JOIN documents d ON c.document_id=d.document_id "
+                "WHERE c.chunk_id=? AND v.active=1 AND v.status='ready' AND d.deleted_at IS NULL",
+                (chunk_id,),
+            ).fetchone()
         if not row:
             return None
         chunk = Chunk.model_validate_json(row[0])
