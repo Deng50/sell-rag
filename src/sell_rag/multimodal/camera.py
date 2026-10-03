@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import time
+import threading
 from collections import deque
 from typing import Callable
 
 
 class PresenceGate:
     def __init__(self, window: int = 8, required_hits: int = 5, cooldown_seconds: int = 30):
-        if required_hits > window:
-            raise ValueError("required_hits cannot exceed window")
+        if window <= 0 or not 0 < required_hits <= window or cooldown_seconds < 0:
+            raise ValueError("window/hits must be positive with hits <= window and cooldown >= 0")
         self.samples: deque[bool] = deque(maxlen=window)
         self.required_hits = required_hits
         self.cooldown_seconds = cooldown_seconds
@@ -36,6 +37,7 @@ class PresenceMonitor:
         self.model_path = model_path
         self.camera_index = camera_index
         self.running = False
+        self._stop = threading.Event()
 
     def run(self) -> None:
         import cv2
@@ -44,7 +46,9 @@ class PresenceMonitor:
         model, camera = YOLO(self.model_path), cv2.VideoCapture(self.camera_index)
         self.running = True
         try:
-            while self.running and camera.isOpened():
+            if not camera.isOpened():
+                raise RuntimeError("无法打开摄像头")
+            while not self._stop.is_set():
                 ok, frame = camera.read()
                 if not ok:
                     break
@@ -53,7 +57,9 @@ class PresenceMonitor:
                 if self.gate.observe(present):
                     self.on_presence()
         finally:
+            self.running = False
             camera.release()
 
     def stop(self) -> None:
+        self._stop.set()
         self.running = False
