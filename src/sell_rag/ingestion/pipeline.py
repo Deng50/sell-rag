@@ -143,41 +143,81 @@ class DocumentParser:
             raise
 
     def _docling(self, path: Path) -> list[ParsedElement]:
-        from docling.document_converter import DocumentConverter
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
 
-        document = DocumentConverter().convert(str(path)).document
-        exported = document.export_to_dict()
+        options = PdfPipelineOptions()
+        options.generate_picture_images = True
+        converter = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)})
+        document = converter.convert(str(path)).document
+        return self._docling_elements(document, path)
+
+    def _docling_elements(self, document, path: Path) -> list[ParsedElement]:
         elements: list[ParsedElement] = []
-        for order, item in enumerate(exported.get("texts", [])):
+        section: list[str] = []
+        # iterate_items follows the body tree; separate texts/tables arrays do not.
+        for order, (node, _) in enumerate(document.iterate_items(traverse_pictures=True)):
+            item = node.model_dump(mode="json")
             provenance = (item.get("prov") or [{}])[0]
             bbox_raw = provenance.get("bbox") or {}
+            page_no = provenance.get("page_no")
             bbox = None
-            if bbox_raw:
-                bbox = [float(bbox_raw.get(key, 0)) for key in ("l", "t", "r", "b")]
+            page = document.pages.get(page_no)
+            if bbox_raw and page and page.size.width and page.size.height:
+                left, top, right, bottom = [float(bbox_raw.get(key, 0)) for key in ("l", "t", "r", "b")]
+                if "BOTTOM" in str(bbox_raw.get("coord_origin", "")).upper():
+                    top, bottom = page.size.height - top, page.size.height - bottom
+                bbox = [left / page.size.width, min(top, bottom) / page.size.height,
+                        right / page.size.width, max(top, bottom) / page.size.height]
             label = str(item.get("label", "text"))
-            content_type = "title" if "title" in label or "heading" in label else "text"
+            metadata = {"docling_label": label, "order": order, "bbox_raw": bbox_raw}
+            if label == "table":
+                grid = [[cell.text for cell in row] for row in node.data.grid]
+                elements.append(ParsedElement(
+                    "table", text=self._table_markdown(grid), table_json=grid,
+                    page_no=page_no, bbox=bbox, section_path=list(section), metadata=metadata,
+                ))
+                continue
+            if label == "picture":
+                caption = node.caption_text(document)
+                picture = node.get_image(document)
+                image_ref = None
+                if picture is not None:
+                    image_path = path.parent / "extracted-images" / f"figure-{order}.png"
+                    image_path.parent.mkdir(exist_ok=True)
+                    picture.save(image_path, format="PNG")
+                    image_ref = str(image_path)
+                    if self.image_describer:
+                        caption = "\n".join(filter(None, [caption, self.image_describer(image_path)]))
+                elements.append(ParsedElement(
+                    "image", text=caption, image_ref=image_ref, page_no=page_no, bbox=bbox,
+                    section_path=list(section), metadata=metadata,
+                ))
+                continue
+            content_type = "title" if label in {"title", "section_header"} else "text"
+            text = str(item.get("text", "")).strip()
+            if content_type == "title":
+                level = max(1, int(item.get("level") or 1))
+                section = section[:level - 1] + [text]
             elements.append(ParsedElement(
-                content_type=content_type,
-                text=str(item.get("text", "")).strip(),
-                title=str(item.get("text", "")).strip() if content_type == "title" else "",
-                page_no=provenance.get("page_no"), bbox=bbox, metadata={"docling_label": label, "order": order},
-            ))
-        for table in exported.get("tables", []):
-            provenance = (table.get("prov") or [{}])[0]
-            grid = table.get("data", {}).get("grid") or table.get("table_cells") or []
-            markdown = self._table_markdown(grid)
-            elements.append(ParsedElement(
-                content_type="table", text=markdown, table_json=grid,
-                page_no=provenance.get("page_no"), metadata={"docling": True},
+                content_type=content_type, text=text, title=text if content_type == "title" else "",
+                section_path=list(section), page_no=page_no, bbox=bbox, metadata=metadata,
             ))
         return parse_header_footer_candidates([item for item in elements if item.text or item.image_ref])
 
     def _docx_fallback(self, path: Path) -> list[ParsedElement]:
         from docx import Document
+        from docx.table import Table
 
         doc = Document(str(path))
         result, section = [], []
-        for paragraph in doc.paragraphs:
+        for paragraph in doc.iter_inner_content():
+            if isinstance(paragraph, Table):
+                grid = [[cell.text.strip() for cell in row.cells] for row in paragraph.rows]
+                result.append(ParsedElement("table", text=self._table_markdown(grid), table_json=grid,
+                                            section_path=list(section)))
+                continue
             text = paragraph.text.strip()
             if not text:
                 continue
@@ -189,10 +229,6 @@ class DocumentParser:
                 result.append(ParsedElement("title", text=text, title=text, section_path=list(section)))
             else:
                 result.append(ParsedElement("text", text=text, section_path=list(section)))
-        for table in doc.tables:
-            grid = [[cell.text.strip() for cell in row.cells] for row in table.rows]
-            result.append(ParsedElement("table", text=self._table_markdown(grid), table_json=grid,
-                                        section_path=list(section)))
         return result
 
     def _pdf_fallback(self, path: Path) -> list[ParsedElement]:
@@ -232,7 +268,6 @@ class DocumentParser:
 
     def _xlsx(self, path: Path) -> tuple[list[ParsedElement], list[Product]]:
         from openpyxl import load_workbook
-        from openpyxl.utils import get_column_letter
 
         formulas = load_workbook(path, data_only=False)
         try:

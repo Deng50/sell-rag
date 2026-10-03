@@ -119,3 +119,48 @@ def test_table_serialization_preserves_zero_and_docling_cell_text() -> None:
 
     table = DocumentParser._table_markdown([["stock", "price"], [0, {"text": "2.00"}]])
     assert "| 0 | 2.00 |" in table
+
+
+def test_docx_fallback_preserves_table_position_and_section(tmp_path) -> None:
+    docx = pytest.importorskip("docx")
+    from sell_rag.ingestion.pipeline import DocumentParser
+
+    path = tmp_path / "ordered.docx"
+    document = docx.Document()
+    document.add_heading("第一节", level=1)
+    document.add_table(rows=1, cols=1).cell(0, 0).text = "第一节表格"
+    document.add_heading("第二节", level=1)
+    document.add_paragraph("第二节正文")
+    document.save(path)
+    parsed = DocumentParser()._docx_fallback(path)
+    assert [item.content_type for item in parsed] == ["title", "table", "title", "text"]
+    assert parsed[1].section_path == ["第一节"]
+
+
+def test_docling_order_coordinates_and_cell_values(tmp_path) -> None:
+    from types import SimpleNamespace
+    from sell_rag.ingestion.pipeline import DocumentParser
+
+    class Node:
+        def __init__(self, label, text, page_no, top, bottom):
+            self.payload = {"label": label, "text": text, "prov": [{"page_no": page_no,
+                "bbox": {"l": 0, "t": top, "r": 100, "b": bottom, "coord_origin": "TOPLEFT"}}]}
+            self.data = SimpleNamespace(grid=[[SimpleNamespace(text="库存")], [SimpleNamespace(text="0")]])
+
+        def model_dump(self, **kwargs):
+            return self.payload
+
+    nodes = []
+    for page in range(1, 4):
+        nodes.extend([Node("text", "固定页眉", page, 1, 5),
+                      Node("text", "重复但有效正文", page, 20, 50),
+                      Node("table", "", page, 60, 80)])
+    document = SimpleNamespace(
+        iterate_items=lambda **kwargs: ((node, 0) for node in nodes),
+        pages={page: SimpleNamespace(size=SimpleNamespace(width=100, height=100)) for page in range(1, 4)},
+    )
+    parsed = DocumentParser()._docling_elements(document, tmp_path / "doc.pdf")
+    assert [item.content_type for item in parsed] == ["text", "table"] * 3
+    assert parsed[0].text == "重复但有效正文"
+    assert parsed[0].bbox == [0, 0.2, 1, 0.5]
+    assert parsed[1].table_json == [["库存"], ["0"]]
