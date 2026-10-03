@@ -5,7 +5,7 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -358,11 +358,17 @@ class Database:
             clauses.append("category=?")
             values.append(category)
         if min_price is not None:
+            minimum_cents = int((min_price * 100).to_integral_value(rounding=ROUND_CEILING))
+            if minimum_cents > 9223372036854775807:
+                return []
             clauses.append("price_cents>=?")
-            values.append(int(min_price * 100))
+            values.append(max(0, minimum_cents))
         if max_price is not None:
+            maximum_cents = int((max_price * 100).to_integral_value(rounding=ROUND_FLOOR))
+            if maximum_cents < 0:
+                return []
             clauses.append("price_cents<=?")
-            values.append(int(max_price * 100))
+            values.append(min(9223372036854775807, maximum_cents))
         if in_stock:
             clauses.append("stock>0")
         values.append(limit)

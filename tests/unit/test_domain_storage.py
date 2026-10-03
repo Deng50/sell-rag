@@ -147,3 +147,10 @@ def test_reopening_database_after_acl_version_change_preserves_versions(services
     assert len(reopened.list_documents()) == 2
     assert reopened.active_chunks(Role.GUEST) == []
     assert reopened.active_chunks(Role.ADMIN)
+
+
+def test_price_filters_preserve_subcent_bounds_and_handle_large_budgets(services) -> None:
+    services.database.upsert_product(Product(sku="A", name="水", price="2.00"))
+    assert services.database.query_products(min_price=Decimal("2.001")) == []
+    assert services.database.query_products(min_price=Decimal("1e30")) == []
+    assert services.database.query_products(max_price=Decimal("1e30"))[0].sku == "A"
