@@ -459,7 +459,7 @@ class ParentChildChunker:
                     section_path=element.section_path, page_no=element.page_no,
                     sheet_name=element.sheet_name, cell_range=element.cell_range,
                     content_type=element.content_type, acl=acl,
-                    prompt_injection=any(p.search(parent_text) for p in INJECTION_PATTERNS),
+                    prompt_injection=any(p.search(text) for p in INJECTION_PATTERNS),
                     metadata={"element_id": element.element_id, **element.metadata},
                 )
                 chunks.append(Chunk(
@@ -501,7 +501,7 @@ class ParentChildChunker:
 
 
 class IngestionService:
-    PARSER_VERSION = "sell-rag-v1"
+    PARSER_VERSION = "sell-rag-v2"
 
     def __init__(self, settings: Settings, database: Database,
                  image_describer: Callable[[Path], str] | None = None):

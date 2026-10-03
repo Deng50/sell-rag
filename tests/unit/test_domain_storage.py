@@ -118,3 +118,19 @@ def test_stale_index_publication_is_rejected(services) -> None:
         services.database.save_index_version("stale", {}, True,
                                              expected_index=first["version"], verify_current=True)
     assert services.database.active_index()["index_version"] == second["version"]
+
+
+def test_old_incomplete_product_snapshot_requires_reingestion(services, tmp_path) -> None:
+    source = tmp_path / "legacy.csv"
+    source.write_text("sku,name,price,stock\nA,水,2,10", encoding="utf-8")
+    services.ingestion.PARSER_VERSION = "sell-rag-v1"
+    first = services.ingestion.ingest(source)
+    document_id = first["document"]["document_id"]
+    with services.database.connect() as db:
+        db.execute("DELETE FROM product_versions")
+    with pytest.raises(ValueError, match="缺少完整商品快照"):
+        services.database.activate_version(document_id, 1)
+    services.ingestion.PARSER_VERSION = "sell-rag-v2"
+    upgraded = services.ingestion.ingest(source)
+    assert upgraded["document"]["version"] == 2
+    assert services.database.query_products()[0].price == Decimal("2")
