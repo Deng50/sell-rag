@@ -38,3 +38,50 @@ def test_new_version_can_roll_back(services, tmp_path) -> None:
     assert any("第二版" in item.text for item in services.database.active_chunks(Role.GUEST))
     services.database.activate_version(document_id, 1)
     assert any("第一版" in item.text for item in services.database.active_chunks(Role.GUEST))
+
+
+def test_product_snapshots_follow_version_rollback_and_deletion(services, tmp_path) -> None:
+    source = tmp_path / "catalog.csv"
+    source.write_text("sku,name,price,stock\nA,水,2,10\nB,茶,4,5", encoding="utf-8")
+    first = services.ingestion.ingest(source)
+    source.write_text("sku,name,price,stock\nA,水,9,1", encoding="utf-8")
+    services.ingestion.ingest(source)
+    assert [(p.sku, p.price) for p in services.database.query_products()] == [("A", Decimal("9"))]
+    document_id = first["document"]["document_id"]
+    services.database.activate_version(document_id, 1)
+    assert [(p.sku, p.stock) for p in services.database.query_products()] == [("A", 10), ("B", 5)]
+    services.database.soft_delete_document(document_id)
+    assert services.database.query_products() == []
+    services.database.activate_version(document_id, 1)
+    assert len(services.database.query_products()) == 2
+
+
+def test_product_acl_is_applied_before_result_limit(services) -> None:
+    services.database.upsert_product(Product(sku="private", name="内部", price=1, acl=[Role.ADMIN]))
+    services.database.upsert_product(Product(sku="public", name="公开", price=2))
+    assert [p.sku for p in services.database.query_products(limit=1)] == ["public"]
+
+
+def test_acl_change_creates_version_and_failed_parse_can_retry(services, tmp_path, monkeypatch) -> None:
+    source = tmp_path / "policy.md"
+    source.write_text("可见资料", encoding="utf-8")
+    original = services.ingestion.parser.parse
+    monkeypatch.setattr(services.ingestion.parser, "parse", lambda _: (_ for _ in ()).throw(RuntimeError("temporary")))
+    with pytest.raises(RuntimeError):
+        services.ingestion.ingest(source)
+    monkeypatch.setattr(services.ingestion.parser, "parse", original)
+    retried = services.ingestion.ingest(source)
+    assert retried["document"]["status"] == "ready"
+    assert retried["document"]["version"] == 1
+    private = services.ingestion.ingest(source, acl=[Role.ADMIN])
+    assert private["document"]["version"] == 2
+    assert services.database.active_chunks(Role.GUEST) == []
+
+
+def test_duplicate_sku_from_another_source_does_not_replace_existing_product(services, tmp_path) -> None:
+    source = tmp_path / "catalog.csv"
+    source.write_text("sku,name,price,stock\nA,水,2,10", encoding="utf-8")
+    services.ingestion.ingest(source, source_id="original")
+    with pytest.raises(ValueError, match="SKU A"):
+        services.ingestion.ingest(source, source_id="another", acl=[Role.ADMIN])
+    assert services.database.query_products()[0].price == Decimal("2")

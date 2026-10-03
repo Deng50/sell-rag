@@ -83,6 +83,13 @@ class Database:
                     price_cents INTEGER NOT NULL, stock INTEGER NOT NULL, active INTEGER NOT NULL,
                     source_document_id TEXT, payload_json TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS product_versions (
+                    document_id TEXT NOT NULL, document_version INTEGER NOT NULL,
+                    sku TEXT NOT NULL, payload_json TEXT NOT NULL,
+                    PRIMARY KEY(document_id, document_version, sku),
+                    FOREIGN KEY(document_id, document_version)
+                        REFERENCES document_versions(document_id, version) ON DELETE CASCADE
+                );
                 CREATE TABLE IF NOT EXISTS jobs (
                     job_id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL,
                     progress REAL NOT NULL DEFAULT 0, detail TEXT,
@@ -107,12 +114,26 @@ class Database:
                 );
                 """
             )
+            # Preserve the currently available snapshot when upgrading an existing database.
+            db.execute(
+                "INSERT OR IGNORE INTO product_versions SELECT p.source_document_id, "
+                "v.version,p.sku,p.payload_json FROM products p JOIN document_versions v "
+                "ON p.source_document_id=v.document_id "
+                "AND json_extract(p.payload_json,'$.source_document_version')=v.version"
+            )
+            db.execute("DROP INDEX IF EXISTS idx_version_hash")
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_version_content_policy "
+                "ON document_versions(document_id,sha256,acl_json,parser_version)"
+            )
 
     def begin_document_version(
         self, *, source_id: str, filename: str, source_type: str, sha256: str,
         owner: str, acl: list[Role], parser_version: str, stored_path: str,
     ) -> tuple[DocumentVersion, bool]:
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            acl_json = _json(sorted({x.value for x in acl}))
             row = db.execute("SELECT * FROM documents WHERE source_id=?", (source_id,)).fetchone()
             document_id = row["document_id"] if row else uuid.uuid5(uuid.NAMESPACE_URL, source_id).hex
             if not row:
@@ -122,16 +143,24 @@ class Database:
                 )
             duplicate = db.execute(
                 "SELECT version,status,active,created_at,error FROM document_versions "
-                "WHERE document_id=? AND sha256=?", (document_id, sha256),
+                "WHERE document_id=? AND sha256=? AND acl_json=? AND parser_version=?",
+                (document_id, sha256, acl_json, parser_version),
             ).fetchone()
             if duplicate:
+                retry = duplicate["status"] == "failed"
+                if retry:
+                    db.execute(
+                        "UPDATE document_versions SET status='processing',error=NULL "
+                        "WHERE document_id=? AND version=?", (document_id, duplicate["version"]),
+                    )
                 return DocumentVersion(
                     document_id=document_id, source_id=source_id, version=duplicate["version"],
                     filename=filename, source_type=source_type, sha256=sha256, owner=owner,
-                    acl=acl, parser_version=parser_version, status=duplicate["status"],
+                    acl=acl, parser_version=parser_version,
+                    status="processing" if retry else duplicate["status"],
                     active=bool(duplicate["active"]), created_at=duplicate["created_at"],
                     error=duplicate["error"],
-                ), True
+                ), not retry
             version = db.execute(
                 "SELECT COALESCE(MAX(version),0)+1 FROM document_versions WHERE document_id=?",
                 (document_id,),
@@ -139,7 +168,7 @@ class Database:
             created_at = _now()
             db.execute(
                 "INSERT INTO document_versions VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (document_id, version, source_type, sha256, _json([x.value for x in acl]),
+                (document_id, version, source_type, sha256, acl_json,
                  parser_version, "processing", 0, created_at, None, stored_path),
             )
             return DocumentVersion(
@@ -169,22 +198,35 @@ class Database:
                     _json([x.value for x in chunk.acl]), int(chunk.prompt_injection),
                     chunk.model_dump_json(),
                 ))
+            db.execute("DELETE FROM product_versions WHERE document_id=? AND document_version=?",
+                       (version.document_id, version.version))
             for product in products:
-                db.execute(
-                    "INSERT INTO products VALUES(?,?,?,?,?,?,?,?,?) "
-                    "ON CONFLICT(sku) DO UPDATE SET name=excluded.name,category=excluded.category,"
-                    "price_cents=excluded.price_cents,stock=excluded.stock,active=excluded.active,"
-                    "source_document_id=excluded.source_document_id,payload_json=excluded.payload_json,"
-                    "updated_at=excluded.updated_at",
-                    (product.sku, product.name, product.category, int(product.price * 100),
-                     product.stock, int(product.active), product.source_document_id,
-                     product.model_dump_json(), product.updated_at.isoformat()),
-                )
+                db.execute("INSERT INTO product_versions VALUES(?,?,?,?)", (
+                    version.document_id, version.version, product.sku, product.model_dump_json(),
+                ))
+            self._restore_products(db, version.document_id, version.version)
             db.execute("UPDATE document_versions SET active=0 WHERE document_id=?", (version.document_id,))
             db.execute(
                 "UPDATE document_versions SET status='ready',active=1,error=NULL "
                 "WHERE document_id=? AND version=?", (version.document_id, version.version),
             )
+            db.execute("UPDATE documents SET deleted_at=NULL WHERE document_id=?", (version.document_id,))
+
+    @staticmethod
+    def _restore_products(db: sqlite3.Connection, document_id: str, version: int) -> None:
+        db.execute("DELETE FROM products WHERE source_document_id=?", (document_id,))
+        for row in db.execute(
+            "SELECT payload_json FROM product_versions WHERE document_id=? AND document_version=?",
+            (document_id, version),
+        ).fetchall():
+            product = Product.model_validate_json(row[0])
+            if db.execute("SELECT 1 FROM products WHERE sku=?", (product.sku,)).fetchone():
+                raise ValueError(f"SKU {product.sku} 已由其他文档或手工商品占用")
+            db.execute("INSERT INTO products VALUES(?,?,?,?,?,?,?,?,?)", (
+                product.sku, product.name, product.category, int(product.price * 100),
+                product.stock, int(product.active), document_id,
+                product.model_dump_json(), product.updated_at.isoformat(),
+            ))
 
     def fail_document_version(self, document_id: str, version: int, error: str) -> None:
         with self.connect() as db:
@@ -210,6 +252,7 @@ class Database:
             ).fetchone()
             if not target or target["status"] != "ready":
                 raise ValueError("Only a ready document version can be activated")
+            self._restore_products(db, document_id, version)
             db.execute("UPDATE document_versions SET active=0 WHERE document_id=?", (document_id,))
             db.execute("UPDATE document_versions SET active=1 WHERE document_id=? AND version=?",
                        (document_id, version))
@@ -221,6 +264,7 @@ class Database:
                 raise KeyError(document_id)
             db.execute("UPDATE documents SET deleted_at=? WHERE document_id=?", (_now(), document_id))
             db.execute("UPDATE document_versions SET active=0 WHERE document_id=?", (document_id,))
+            db.execute("DELETE FROM products WHERE source_document_id=?", (document_id,))
 
     def active_chunks(self, role: Role, *, children_only: bool = True) -> list[Chunk]:
         query = (
@@ -261,8 +305,13 @@ class Database:
         self, *, text: str | None = None, category: str | None = None,
         min_price: Decimal | None = None, max_price: Decimal | None = None,
         in_stock: bool = False, limit: int = 20, role: Role = Role.GUEST,
+        sku: str | None = None,
     ) -> list[Product]:
-        clauses, values = ["active=1"], []
+        clauses = ["active=1", "EXISTS (SELECT 1 FROM json_each(payload_json,'$.acl') WHERE value=?)"]
+        values: list[Any] = [role.value]
+        if sku is not None:
+            clauses.append("sku=?")
+            values.append(sku)
         if text:
             clauses.append("(name LIKE ? OR sku LIKE ? OR payload_json LIKE ?)")
             values.extend([f"%{text}%"] * 3)
@@ -292,6 +341,7 @@ class Database:
                 "INSERT INTO products VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(sku) DO UPDATE SET "
                 "name=excluded.name,category=excluded.category,price_cents=excluded.price_cents,"
                 "stock=excluded.stock,active=excluded.active,payload_json=excluded.payload_json,"
+                "source_document_id=excluded.source_document_id,"
                 "updated_at=excluded.updated_at",
                 (product.sku, product.name, product.category, int(product.price * 100), product.stock,
                  int(product.active), product.source_document_id, product.model_dump_json(),

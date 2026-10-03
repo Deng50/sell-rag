@@ -434,7 +434,9 @@ class IngestionService:
         self.validator.validate(source)
         digest = self.validator.sha256(source)
         source_id = source_id or source.name
-        acl = acl or [Role.GUEST, Role.OPERATOR, Role.ADMIN]
+        acl = [Role.GUEST, Role.OPERATOR, Role.ADMIN] if acl is None else acl
+        if not acl:
+            raise ValueError("ACL 不能为空")
         safe_source = hashlib.sha256(source_id.encode()).hexdigest()[:16]
         stored_dir = self.settings.documents_dir / safe_source / digest
         stored_dir.mkdir(parents=True, exist_ok=True)
@@ -447,6 +449,9 @@ class IngestionService:
             stored_path=str(stored_path),
         )
         if duplicate:
+            if version.status == "ready" and not version.active:
+                self.database.activate_version(version.document_id, version.version)
+                version.active = True
             return {"document": version.model_dump(mode="json"), "duplicate": True}
         try:
             parsed, products = self.parser.parse(stored_path)
