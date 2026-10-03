@@ -32,3 +32,53 @@ def test_regression_evaluation_runs(services) -> None:
     metrics = services.evaluation.run("tests/fixtures/evaluation.jsonl")
     assert metrics["case_count"] == 3
     assert {"recall_at_3", "mrr_at_10", "ndcg_at_10", "citation_accuracy"} <= metrics.keys()
+
+
+def test_fake_synthesis_is_a_valid_wave_file() -> None:
+    import io
+    import wave
+    from sell_rag.multimodal import FakeSpeech
+
+    with wave.open(io.BytesIO(FakeSpeech().synthesize("测试"))) as audio:
+        assert audio.getframerate() == 16000
+        assert audio.getnframes() > 0
+
+
+def test_barge_in_does_not_play_audio_from_cancelled_synthesis() -> None:
+    import threading
+    from sell_rag.multimodal import StreamingTTSPlayer
+
+    started, release = threading.Event(), threading.Event()
+    played = []
+
+    class Provider:
+        def synthesize(self, text):
+            if text == "旧回答。":
+                started.set()
+                assert release.wait(2)
+            return text.encode()
+
+    player = StreamingTTSPlayer(Provider(), played.append)
+    player.speak("旧回答。")
+    assert started.wait(1)
+    old_threads = player._threads
+    player.speak("新回答。")
+    release.set()
+    assert player.wait(2)
+    for thread in old_threads:
+        thread.join(2)
+        assert not thread.is_alive()
+    assert played == ["新回答。".encode()]
+
+
+def test_synthesis_failure_terminates_consumer() -> None:
+    from sell_rag.multimodal import StreamingTTSPlayer
+
+    class Provider:
+        def synthesize(self, _):
+            raise RuntimeError("offline")
+
+    player = StreamingTTSPlayer(Provider(), lambda _: None)
+    player.speak("测试。")
+    assert player.wait(2)
+    assert isinstance(player.last_error, RuntimeError)

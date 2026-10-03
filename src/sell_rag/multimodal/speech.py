@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import base64
 import collections
-import json
+import io
 import queue
 import re
 import threading
 import time
+import wave
 from difflib import get_close_matches
 from typing import Callable, Protocol
 from urllib.parse import urlencode
@@ -31,7 +32,13 @@ class FakeSpeech:
         return Transcript(text=text, confidence=0.99, needs_confirmation=False)
 
     def synthesize(self, text: str) -> bytes:
-        return text.encode("utf-8")
+        output = io.BytesIO()
+        with wave.open(output, "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(16000)
+            audio.writeframes(b"\x00\x00" * min(16000, max(1600, len(text) * 800)))
+        return output.getvalue()
 
 
 class BaiduSpeech:
@@ -118,40 +125,73 @@ class SpeechNormalizer:
 class StreamingTTSPlayer:
     """Sentence-level producer/consumer playback with cooperative barge-in."""
 
-    def __init__(self, provider: SpeechProvider, play: Callable[[bytes], None]):
+    def __init__(self, provider: SpeechProvider, play: Callable[[bytes], None],
+                 stop_playback: Callable[[], None] | None = None):
         self.provider = provider
         self.play = play
+        self.stop_playback = stop_playback
         self._stop = threading.Event()
-        self._queue: queue.Queue[bytes | None] = queue.Queue(maxsize=3)
+        self._threads: tuple[threading.Thread, ...] = ()
+        self._play_lock = threading.Lock()
+        self.last_error: Exception | None = None
 
     def speak(self, text: str) -> None:
-        self._stop.clear()
-        sentences = [item.strip() for item in re.split(r"(?<=[。！？；])", text) if item.strip()]
+        self.barge_in()
+        stop = self._stop = threading.Event()
+        audio_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=3)
+        self.last_error = None
+        sentences = [item.strip() for item in re.split(r"(?<=[。！？；.!?])", text) if item.strip()]
+
+        def enqueue(audio: bytes | None) -> None:
+            while not stop.is_set():
+                try:
+                    audio_queue.put(audio, timeout=0.05)
+                    return
+                except queue.Full:
+                    continue
 
         def produce() -> None:
-            for sentence in sentences:
-                if self._stop.is_set():
-                    break
-                self._queue.put(self.provider.synthesize(sentence))
-            self._queue.put(None)
+            try:
+                for sentence in sentences:
+                    if stop.is_set():
+                        break
+                    enqueue(self.provider.synthesize(sentence))
+            except Exception as exc:
+                self.last_error = exc
+            finally:
+                enqueue(None)
 
         def consume() -> None:
-            while not self._stop.is_set():
-                audio = self._queue.get()
-                if audio is None:
-                    break
-                self.play(audio)
+            try:
+                while not stop.is_set():
+                    try:
+                        audio = audio_queue.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    if audio is None:
+                        break
+                    with self._play_lock:
+                        if not stop.is_set():
+                            self.play(audio)
+            except Exception as exc:
+                self.last_error = exc
+                stop.set()
 
-        threading.Thread(target=produce, daemon=True).start()
-        threading.Thread(target=consume, daemon=True).start()
+        self._threads = (threading.Thread(target=produce, daemon=True),
+                         threading.Thread(target=consume, daemon=True))
+        for thread in self._threads:
+            thread.start()
 
     def barge_in(self) -> None:
         self._stop.set()
-        while not self._queue.empty():
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                break
+        if self.stop_playback:
+            self.stop_playback()
+
+    def wait(self, timeout: float = 30) -> bool:
+        deadline = time.monotonic() + timeout
+        for thread in self._threads:
+            thread.join(max(0, deadline - time.monotonic()))
+        return all(not thread.is_alive() for thread in self._threads)
 
 
 class VADRecorder:
@@ -170,12 +210,13 @@ class VADRecorder:
         frame_size = rate * frame_ms // 1000
         vad = webrtcvad.Vad(self.aggressiveness)
         audio = pyaudio.PyAudio()
-        stream = audio.open(format=pyaudio.paInt16, channels=1, rate=rate, input=True,
-                            frames_per_buffer=frame_size)
+        stream = None
         frames: list[bytes] = []
         pre_roll: collections.deque[bytes] = collections.deque(maxlen=10)
         speech_started, silence_frames = False, 0
         try:
+            stream = audio.open(format=pyaudio.paInt16, channels=1, rate=rate, input=True,
+                                frames_per_buffer=frame_size)
             for _ in range(self.max_seconds * 1000 // frame_ms):
                 frame = stream.read(frame_size, exception_on_overflow=False)
                 active = vad.is_speech(frame, rate)
@@ -190,7 +231,8 @@ class VADRecorder:
                     if silence_frames * frame_ms >= self.silence_ms:
                         break
         finally:
-            stream.stop_stream()
-            stream.close()
+            if stream is not None:
+                stream.stop_stream()
+                stream.close()
             audio.terminate()
         return b"".join(frames)
