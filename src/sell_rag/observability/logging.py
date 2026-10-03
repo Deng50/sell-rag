@@ -26,12 +26,19 @@ class JsonFormatter(logging.Formatter):
 def configure_logging(runtime_dir: Path, level: int = logging.INFO) -> None:
     log_dir = runtime_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    handler = RotatingFileHandler(log_dir / "sell-rag.jsonl", maxBytes=5_000_000, backupCount=5, encoding="utf-8")
-    handler.setFormatter(JsonFormatter())
     root = logging.getLogger()
     root.setLevel(level)
-    if not any(isinstance(item, RotatingFileHandler) for item in root.handlers):
-        root.addHandler(handler)
+    destination = str((log_dir / "sell-rag.jsonl").resolve())
+    for existing in list(root.handlers):
+        if getattr(existing, "_sell_rag_handler", False):
+            if existing.baseFilename == destination:
+                return
+            root.removeHandler(existing)
+            existing.close()
+    handler = RotatingFileHandler(destination, maxBytes=5_000_000, backupCount=5, encoding="utf-8")
+    handler._sell_rag_handler = True
+    handler.setFormatter(JsonFormatter())
+    root.addHandler(handler)
 
 
 @contextmanager

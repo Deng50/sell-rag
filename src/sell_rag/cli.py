@@ -7,6 +7,7 @@ import typer
 
 from sell_rag.app import build_services
 from sell_rag.domain import Role
+from sell_rag.settings import Settings
 
 app = typer.Typer(help="Sell-RAG local service and administration CLI", no_args_is_help=True)
 
@@ -15,10 +16,10 @@ app = typer.Typer(help="Sell-RAG local service and administration CLI", no_args_
 def serve(host: str | None = None, port: int | None = None, reload: bool = False) -> None:
     """Start the local FastAPI service."""
     import uvicorn
-    services = build_services()
+    settings = Settings.load()
     uvicorn.run("sell_rag.api.main:create_app", factory=True,
-                host=host or services.settings.host,
-                port=port or services.settings.port, reload=reload)
+                host=host or settings.host,
+                port=port or settings.port, reload=reload)
 
 
 @app.command()
