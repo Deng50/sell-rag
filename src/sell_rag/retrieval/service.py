@@ -15,6 +15,7 @@ class QueryAnalysis:
     route: QueryRoute
     product_text: str | None = None
     product_names: list[str] = field(default_factory=list)
+    product_skus: list[str] = field(default_factory=list)
     category: str | None = None
     min_price: Decimal | None = None
     max_price: Decimal | None = None
@@ -31,24 +32,36 @@ class QueryAnalyzer:
 
     def analyze(self, query: str, role: Role = Role.GUEST) -> QueryAnalysis:
         clean = query.strip()
-        if clean.lower() in self.GREETINGS or len(clean) <= 2:
+        if clean.lower() in self.GREETINGS:
             return QueryAnalysis(QueryRoute.CHITCHAT)
         if clean in {"推荐", "商品", "价格"}:
             return QueryAnalysis(QueryRoute.CLARIFY)
-        products = self.database.query_products(limit=500, role=role)
-        matched_products = [item for item in products if item.name in clean or item.sku.lower() in clean.lower()]
+        products = self.database.query_products(limit=10000, role=role)
+        sku_matches = [item for item in products if re.search(
+            r"(?<![A-Za-z0-9_-])" + re.escape(item.sku) + r"(?![A-Za-z0-9_-])", clean, re.I
+        )]
+        named = [item for item in products if item.name in clean]
+        named = [item for item in named
+                 if not any(item.name != other.name and item.name in other.name for other in named)]
+        matched_products = sku_matches + [item for item in named
+                                          if item.name not in {p.name for p in sku_matches}]
         price_range = re.search(r"(\d+(?:\.\d+)?)\s*(?:-|到|至)\s*(\d+(?:\.\d+)?)\s*元", clean)
-        max_price = re.search(r"(\d+(?:\.\d+)?)\s*元\s*(?:以下|以内|不超过)", clean)
-        min_price = re.search(r"(?:超过|高于|至少)\s*(\d+(?:\.\d+)?)\s*元", clean)
+        max_price = (re.search(r"(\d+(?:\.\d+)?)\s*元\s*(?:以下|以内|不超过)", clean)
+                     or re.search(r"(?:不超过|至多|最多|低于)\s*(\d+(?:\.\d+)?)\s*元", clean))
+        min_price = (re.search(r"(?:超过|高于|至少)\s*(\d+(?:\.\d+)?)\s*元", clean)
+                     or re.search(r"(\d+(?:\.\d+)?)\s*元\s*(?:以上|起)", clean))
         category = next((item.category for item in products if item.category and item.category in clean), None)
         filters = dict(
             product_text=matched_products[0].name if len(matched_products) == 1 else None,
             product_names=[item.name for item in matched_products],
+            product_skus=[item.sku for item in matched_products],
             category=category,
             min_price=Decimal(price_range.group(1)) if price_range else (Decimal(min_price.group(1)) if min_price else None),
             max_price=Decimal(price_range.group(2)) if price_range else (Decimal(max_price.group(1)) if max_price else None),
-            in_stock=any(word in clean for word in ("有货", "库存", "还有")),
+            in_stock=any(word in clean for word in ("有货", "还有")),
         )
+        if any(word in clean for word in self.RECOMMEND):
+            return QueryAnalysis(QueryRoute.PRODUCT_RECOMMENDATION, **filters)
         if matched_products or any(word in clean.lower() for word in self.EXACT):
             return QueryAnalysis(QueryRoute.PRODUCT_EXACT, **filters)
         if any(word in clean for word in self.RECOMMEND) or category or price_range or max_price or min_price:
@@ -94,10 +107,14 @@ class RetrievalService:
         return hits, citations, "\n\n".join(evidence_parts)
 
     def products(self, analysis: QueryAnalysis, role: Role) -> list[Product]:
-        if analysis.product_names:
+        if analysis.product_skus:
             selected = []
-            for name in analysis.product_names:
-                selected.extend(self.database.query_products(text=name, in_stock=False, limit=1, role=role))
+            for sku in analysis.product_skus:
+                selected.extend(self.database.query_products(
+                    sku=sku, min_price=analysis.min_price, max_price=analysis.max_price,
+                    in_stock=analysis.route == QueryRoute.PRODUCT_RECOMMENDATION,
+                    limit=1, role=role,
+                ))
             return list({item.sku: item for item in selected}.values())
         return self.database.query_products(
             text=analysis.product_text, category=analysis.category,

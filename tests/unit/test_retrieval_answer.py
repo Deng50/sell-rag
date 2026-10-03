@@ -125,3 +125,26 @@ def test_changed_embedding_model_rebuilds_persisted_index(services, tmp_path) ->
     index = IndexManager(services.settings, services.database, embedding=replacement)
     assert index.search("鲸鱼", Role.GUEST)
     assert index.version != services.index.version
+
+
+def test_product_matching_uses_exact_skus_and_prefers_longer_names(services) -> None:
+    from sell_rag.domain import Product
+
+    for sku, name, price in [("A", "矿泉水", 1), ("AA", "矿泉水", 9), ("B", "水", 0.5)]:
+        services.database.upsert_product(Product(sku=sku, name=name, price=price, stock=3))
+    answer = services.answer.answer(QueryRequest(query="SKU AA 多少钱"))
+    assert [p.sku for p in answer.products] == ["AA"]
+    assert "9.00" in answer.answer
+    by_name = services.answer.answer(QueryRequest(query="矿泉水价格"))
+    assert {p.sku for p in by_name.products} == {"A", "AA"}
+
+
+def test_short_queries_clarify_and_named_recommendations_apply_budget(services) -> None:
+    from sell_rag.domain import QueryRoute
+
+    _seed(services, Path("tests/fixtures"))
+    assert services.answer.answer(QueryRequest(query="价格")).route == QueryRoute.CLARIFY
+    answer = services.answer.answer(QueryRequest(query="推荐不超过1元的清泉饮用水"))
+    assert answer.refused
+    stock = services.answer.answer(QueryRequest(query="每日坚果库存"))
+    assert "库存 0" in stock.answer
