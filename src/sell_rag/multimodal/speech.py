@@ -94,11 +94,12 @@ class BaiduSpeech:
 
 
 class SpeechNormalizer:
-    def __init__(self, hotwords: list[str] | None = None):
+    def __init__(self, hotwords: list[str] | None = None, confirm_threshold: float = 0.65):
         self.hotwords = hotwords or []
+        self.confirm_threshold = confirm_threshold
 
     def normalize(self, transcript: Transcript) -> Transcript:
-        text = re.sub(r"\s+", "", transcript.text).strip("，。！？ ")
+        text = re.sub(r"\s+", " ", transcript.text).strip("，。！？ ")
         alternatives = list(transcript.alternatives)
         for token in re.findall(r"[\u4e00-\u9fff]{2,}", text):
             match = get_close_matches(token, self.hotwords, n=2, cutoff=0.72)
@@ -107,7 +108,7 @@ class SpeechNormalizer:
             elif len(match) > 1:
                 alternatives.extend(match)
         ambiguous = len(set(alternatives)) > 1
-        low_confidence = transcript.confidence is not None and transcript.confidence < 0.65
+        low_confidence = transcript.confidence is not None and transcript.confidence < self.confirm_threshold
         return transcript.model_copy(update={
             "text": text, "alternatives": list(dict.fromkeys(alternatives)),
             "needs_confirmation": transcript.needs_confirmation or low_confidence or ambiguous,

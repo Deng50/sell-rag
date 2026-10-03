@@ -250,7 +250,9 @@ class Database:
                 "SELECT status FROM document_versions WHERE document_id=? AND version=?",
                 (document_id, version),
             ).fetchone()
-            if not target or target["status"] != "ready":
+            if not target:
+                raise KeyError((document_id, version))
+            if target["status"] != "ready":
                 raise ValueError("Only a ready document version can be activated")
             self._restore_products(db, document_id, version)
             db.execute("UPDATE document_versions SET active=0 WHERE document_id=?", (document_id,))

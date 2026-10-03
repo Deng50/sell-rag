@@ -1,9 +1,9 @@
 import asyncio
 import hmac
 import json
-import re
+from decimal import Decimal
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from sell_rag.app import Services, build_services
 from sell_rag.domain import Product, QueryRequest, Role
+from sell_rag.multimodal import SpeechNormalizer
 from sell_rag.settings import Settings
 
 
@@ -43,9 +44,10 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
             raise HTTPException(400, "无效角色") from exc
         if role == Role.GUEST:
             return role
-        token = authorization.removeprefix("Bearer ").strip() if authorization else ""
+        scheme, _, token = (authorization or "").partition(" ")
         expected = services.settings.admin_token if role == Role.ADMIN else services.settings.operator_token
-        if not expected or not hmac.compare_digest(token, expected):
+        if (scheme.lower() != "bearer" or not expected
+                or not hmac.compare_digest(token.strip().encode("utf-8"), expected.encode("utf-8"))):
             raise HTTPException(401, "管理令牌无效或未配置")
         return role
 
@@ -65,7 +67,6 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
             services.database.update_job(job_id, "complete", 1.0, json.dumps(manifest, ensure_ascii=False))
         except Exception as exc:
             services.database.update_job(job_id, "failed", 1.0, str(exc))
-
     def ingest_job(job_id: str, path: Path, source_id: str, owner: str, acl: list[Role]) -> None:
         try:
             services.database.update_job(job_id, "running", 0.1, "正在解析文档")
@@ -76,6 +77,9 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
             services.database.update_job(job_id, "complete", 1.0, json.dumps(detail, ensure_ascii=False))
         except Exception as exc:
             services.database.update_job(job_id, "failed", 1.0, str(exc))
+        finally:
+            path.unlink(missing_ok=True)
+            path.parent.rmdir()
 
     @app.get("/health")
     def health() -> dict:
@@ -104,11 +108,12 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
 
         async def events():
             yield f"event: meta\ndata: {json.dumps({'request_id': answer.request_id, 'route': answer.route.value})}\n\n"
-            for piece in re.findall(r".{1,12}", answer.answer):
+            for start in range(0, len(answer.answer), 12):
+                piece = answer.answer[start:start + 12]
                 yield f"event: token\ndata: {json.dumps({'text': piece}, ensure_ascii=False)}\n\n"
                 await asyncio.sleep(0)
             yield f"event: citations\ndata: {json.dumps([item.model_dump(mode='json') for item in answer.citations], ensure_ascii=False)}\n\n"
-            yield "event: done\ndata: {}\n\n"
+            yield f"event: done\ndata: {answer.model_dump_json()}\n\n"
 
         return StreamingResponse(events(), media_type="text/event-stream")
 
@@ -120,7 +125,15 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
         source_id: str | None = None,
         acl: str = "guest,operator,admin",
     ) -> dict:
-        safe_name = Path(file.filename or "upload.bin").name
+        safe_name = (file.filename or "upload.bin").replace("\\", "/").rsplit("/", 1)[-1]
+        if safe_name in {"", ".", ".."}:
+            raise HTTPException(400, "文件名无效")
+        try:
+            roles = [Role(item.strip()) for item in acl.split(",") if item.strip()]
+        except ValueError as exc:
+            raise HTTPException(400, "ACL 包含无效角色") from exc
+        if not roles:
+            raise HTTPException(400, "ACL 不能为空")
         incoming = services.settings.runtime_dir / "incoming"
         incoming.mkdir(parents=True, exist_ok=True)
         maximum = services.settings.max_file_mb * 1024 * 1024
@@ -128,14 +141,9 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
         if len(content) > maximum:
             raise HTTPException(413, f"文件超过 {services.settings.max_file_mb} MB 限制")
         job_id = services.database.create_job("upload")
-        target = incoming / f"{job_id}_{safe_name}"
+        target = incoming / job_id / safe_name
+        target.parent.mkdir()
         target.write_bytes(content)
-        try:
-            roles = [Role(item.strip()) for item in acl.split(",") if item.strip()]
-        except ValueError as exc:
-            raise HTTPException(400, "ACL 包含无效角色") from exc
-        if not roles:
-            raise HTTPException(400, "ACL 不能为空")
         background.add_task(ingest_job, job_id, target, source_id or safe_name, role.value, roles)
         return {"job_id": job_id, "filename": safe_name}
 
@@ -146,7 +154,12 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
     @app.post("/v1/documents/{document_id}/versions/{version}/activate", status_code=202)
     def activate(document_id: str, version: int, background: BackgroundTasks,
                  _: Annotated[Role, Depends(require(Role.ADMIN))]):
-        services.database.activate_version(document_id, version)
+        try:
+            services.database.activate_version(document_id, version)
+        except KeyError as exc:
+            raise HTTPException(404, "文档版本不存在") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
         job_id = services.database.create_job("reindex", f"activate {document_id}:{version}")
         background.add_task(rebuild_job, job_id)
         return {"job_id": job_id}
@@ -177,10 +190,12 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
     def products(
         role: Annotated[Role, Depends(role_dependency)],
         text: str | None = None, category: str | None = None,
-        min_price: float | None = None, max_price: float | None = None,
+        min_price: Decimal | None = Query(None, ge=0, allow_inf_nan=False),
+        max_price: Decimal | None = Query(None, ge=0, allow_inf_nan=False),
         in_stock: bool = False, limit: int = Query(20, ge=1, le=200),
     ):
-        from decimal import Decimal
+        if min_price is not None and max_price is not None and min_price > max_price:
+            raise HTTPException(400, "最低价格不能高于最高价格")
         return services.database.query_products(
             text=text, category=category,
             min_price=Decimal(str(min_price)) if min_price is not None else None,
@@ -195,9 +210,16 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
 
     @app.post("/v1/speech/transcribe")
     async def transcribe(role: Annotated[Role, Depends(role_dependency)], audio: UploadFile = File(...),
-                         sample_rate: int = 16000):
-        del role
-        return services.speech.transcribe(await audio.read(), sample_rate)
+                         sample_rate: Literal[8000, 16000] = 16000):
+        maximum = sample_rate * 2 * 60
+        content = await audio.read(maximum + 1)
+        if len(content) > maximum:
+            raise HTTPException(413, "音频超过 60 秒 PCM 上限")
+        if not content:
+            raise HTTPException(400, "音频不能为空")
+        transcript = await asyncio.to_thread(services.speech.transcribe, content, sample_rate)
+        hotwords = [product.name for product in services.database.query_products(role=role, limit=10000)]
+        return SpeechNormalizer(hotwords, services.settings.asr_confirm_threshold).normalize(transcript)
 
     @app.post("/v1/speech/synthesize")
     def synthesize(body: SpeechSynthesisBody, role: Annotated[Role, Depends(role_dependency)]):
