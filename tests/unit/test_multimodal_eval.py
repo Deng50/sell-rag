@@ -82,3 +82,28 @@ def test_synthesis_failure_terminates_consumer() -> None:
     player.speak("测试。")
     assert player.wait(2)
     assert isinstance(player.last_error, RuntimeError)
+
+
+def test_document_metrics_deduplicate_chunks_and_measure_fractional_recall(services, tmp_path, monkeypatch) -> None:
+    import json
+    from types import SimpleNamespace
+    from sell_rag.domain import AnswerResponse, QueryRoute
+
+    source = tmp_path / "evaluation.jsonl"
+    source.write_text(json.dumps({"query": "问题", "relevant_document_ids": ["a", "b"]}), encoding="utf-8")
+    monkeypatch.setattr(services.index, "search", lambda *args, **kwargs: [
+        SimpleNamespace(chunk=SimpleNamespace(document_id="a")) for _ in range(10)
+    ])
+    monkeypatch.setattr(services.answer, "answer", lambda _: AnswerResponse(answer="没有引用", route=QueryRoute.KNOWLEDGE))
+    metrics = services.evaluation.run(source)
+    assert metrics["recall_at_3"] == 0.5
+    assert 0 < metrics["ndcg_at_10"] < 1
+    assert metrics["citation_accuracy"] == 0
+
+
+def test_unlabelled_retrieval_metrics_are_not_reported_as_perfect(services) -> None:
+    metrics = services.evaluation.run("tests/fixtures/evaluation.jsonl")
+    assert metrics["retrieval_case_count"] == 0
+    assert metrics["recall_at_3"] is None
+    assert metrics["ndcg_at_10"] is None
+    assert table_cell_accuracy([["a", "b"]], [["a"], ["b"]]) == 1 / 3

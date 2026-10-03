@@ -234,8 +234,17 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
     @app.post("/v1/evaluations")
     def evaluate(body: EvaluationBody, _: Annotated[Role, Depends(require(Role.OPERATOR))]):
         path = Path(body.dataset).resolve()
+        allowed = [Path("tests/fixtures").resolve(),
+                   (services.settings.runtime_dir / "evaluations").resolve()]
+        if not any(path.is_relative_to(directory) for directory in allowed):
+            raise HTTPException(403, "评测文件必须位于 tests/fixtures 或 runtime/evaluations 目录")
         if not path.is_file():
             raise HTTPException(404, "评测数据不存在")
-        return services.evaluation.run(path)
+        if path.stat().st_size > services.settings.max_file_mb * 1024 * 1024:
+            raise HTTPException(413, "评测数据过大")
+        try:
+            return services.evaluation.run(path)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise HTTPException(422, f"评测数据格式错误: {exc}") from exc
 
     return app
