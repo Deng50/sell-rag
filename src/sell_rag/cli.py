@@ -34,8 +34,10 @@ def ingest(path: Path, source_id: str | None = None, acl: str = "guest,operator,
     """Ingest one document and atomically rebuild role indexes."""
     services = build_services()
     roles = [Role(value.strip()) for value in acl.split(",") if value.strip()]
-    result = services.ingestion.ingest(path, source_id=source_id, acl=roles)
-    result["index"] = services.index.build()
+    result = services.ingestion.ingest(path, source_id=source_id, acl=roles, activate=False)
+    document = result["document"]
+    result["index"] = services.index.build({document["document_id"]: document["version"]})
+    document["active"] = True
     typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
 
 
@@ -49,8 +51,8 @@ def reindex() -> None:
 def rollback(document_id: str, version: int) -> None:
     """Activate a ready document version and rebuild indexes."""
     services = build_services()
-    services.database.activate_version(document_id, version)
-    typer.echo(json.dumps(services.index.build(), ensure_ascii=False, indent=2))
+    services.database.validate_version(document_id, version)
+    typer.echo(json.dumps(services.index.build({document_id: version}), ensure_ascii=False, indent=2))
 
 
 @app.command()
@@ -73,8 +75,9 @@ def migrate_legacy(path: Path = Path("zhipuai_rag/dataset/chroma_db")) -> None:
             continue
         target = migration_dir / f"{source.parent.name}.md"
         target.write_text(text, encoding="utf-8")
-        migrated.append(services.ingestion.ingest(target, source_id=f"legacy:{source.parent.name}"))
-    manifest = services.index.build()
+        migrated.append(services.ingestion.ingest(target, source_id=f"legacy:{source.parent.name}", activate=False))
+    changes = {item["document"]["document_id"]: item["document"]["version"] for item in migrated}
+    manifest = services.index.build(changes)
     typer.echo(json.dumps({"documents": migrated, "index": manifest}, ensure_ascii=False, indent=2))
 
 

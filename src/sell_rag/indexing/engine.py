@@ -17,6 +17,7 @@ import numpy as np
 from sell_rag.domain import Chunk, Role, SearchHit
 from sell_rag.settings import Settings
 from sell_rag.storage import Database
+from sell_rag.storage.database import IndexConflictError
 
 
 QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
@@ -181,11 +182,18 @@ class IndexManager:
             self.degraded.append("Fake模式使用词项重排")
         return OverlapReranker()
 
-    def build(self) -> dict[str, object]:
+    def build(self, changes: dict[str, int | None] | None = None) -> dict[str, object]:
         with self._lock:
-            return self._build()
+            for attempt in range(3):
+                try:
+                    return self._build(changes)
+                except IndexConflictError:
+                    if attempt == 2:
+                        raise
+            raise AssertionError("unreachable")
 
-    def _build(self) -> dict[str, object]:
+    def _build(self, changes: dict[str, int | None] | None = None) -> dict[str, object]:
+        previous = self.database.active_index()
         version = time.strftime("%Y%m%d_%H%M%S") + "_" + hashlib.sha256(os.urandom(8)).hexdigest()[:8]
         staging = self.settings.indexes_dir / f".{version}.staging"
         target = self.settings.indexes_dir / version
@@ -199,7 +207,8 @@ class IndexManager:
             "degraded": self.degraded,
         }
         for role in Role:
-            chunks = [item for item in self.database.active_chunks(role) if not item.prompt_injection]
+            chunks = [item for item in self.database.active_chunks(role, changes=changes)
+                      if not item.prompt_injection]
             vectors = self._cached_vectors(chunks)
             indexes[role] = RoleIndex(chunks, vectors)
             (staging / f"{role.value}.json").write_text(
@@ -216,7 +225,9 @@ class IndexManager:
         active_tmp = self.settings.indexes_dir / f".{version}.active.tmp"
         active_tmp.write_text(version, encoding="utf-8")
         active_tmp.replace(self.settings.indexes_dir / "ACTIVE")
-        self.database.save_index_version(version, manifest, True)
+        self.database.save_index_version(version, manifest, True, changes=changes,
+                                         expected_index=previous["index_version"] if previous else None,
+                                         verify_current=True)
         self.indexes, self.version = indexes, version
         return manifest
 

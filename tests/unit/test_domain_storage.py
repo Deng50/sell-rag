@@ -85,3 +85,36 @@ def test_duplicate_sku_from_another_source_does_not_replace_existing_product(ser
     with pytest.raises(ValueError, match="SKU A"):
         services.ingestion.ingest(source, source_id="another", acl=[Role.ADMIN])
     assert services.database.query_products()[0].price == Decimal("2")
+
+
+def test_index_failure_does_not_publish_staged_products_or_document(services, tmp_path, monkeypatch) -> None:
+    source = tmp_path / "atomic.csv"
+    source.write_text("sku,name,price,stock\nA,水,2,10", encoding="utf-8")
+    first = services.ingestion.ingest(source)
+    services.index.build()
+    previous = services.database.active_index()["index_version"]
+    source.write_text("sku,name,price,stock\nA,水,9,1", encoding="utf-8")
+    staged = services.ingestion.ingest(source, activate=False)
+    document_id = first["document"]["document_id"]
+    assert services.database.query_products()[0].price == Decimal("2")
+    encode = services.index.embedding.encode_documents
+    monkeypatch.setattr(services.index.embedding, "encode_documents", lambda _: (_ for _ in ()).throw(RuntimeError("model offline")))
+    with pytest.raises(RuntimeError, match="model offline"):
+        services.index.build({document_id: staged["document"]["version"]})
+    assert services.database.query_products()[0].price == Decimal("2")
+    assert services.database.active_index()["index_version"] == previous
+    monkeypatch.setattr(services.index.embedding, "encode_documents", encode)
+    services.index.build({document_id: staged["document"]["version"]})
+    assert services.database.query_products()[0].price == Decimal("9")
+    assert services.database.active_index()["index_version"] != previous
+
+
+def test_stale_index_publication_is_rejected(services) -> None:
+    from sell_rag.storage.database import IndexConflictError
+
+    first = services.index.build()
+    second = services.index.build()
+    with pytest.raises(IndexConflictError):
+        services.database.save_index_version("stale", {}, True,
+                                             expected_index=first["version"], verify_current=True)
+    assert services.database.active_index()["index_version"] == second["version"]

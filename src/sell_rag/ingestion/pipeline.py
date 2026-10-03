@@ -512,7 +512,7 @@ class IngestionService:
         self.chunker = ParentChildChunker(settings.child_tokens, settings.parent_tokens, settings.overlap_ratio)
 
     def ingest(self, path: str | Path, *, source_id: str | None = None, owner: str = "admin",
-               acl: list[Role] | None = None) -> dict[str, Any]:
+               acl: list[Role] | None = None, activate: bool = True) -> dict[str, Any]:
         source = Path(path).resolve()
         self.validator.validate(source)
         digest = self.validator.sha256(source)
@@ -532,7 +532,7 @@ class IngestionService:
             stored_path=str(stored_path),
         )
         if duplicate:
-            if version.status == "ready" and not version.active:
+            if activate and version.status == "ready" and not version.active:
                 self.database.activate_version(version.document_id, version.version)
                 version.active = True
             return {"document": version.model_dump(mode="json"), "duplicate": True}
@@ -562,9 +562,9 @@ class IngestionService:
                         if not any(pattern.search(self.parser._product_text(product))
                                    for pattern in INJECTION_PATTERNS)]
             chunks = self.chunker.chunk(version.document_id, version.version, acl, elements)
-            self.database.complete_document_version(version, elements, chunks, products)
+            self.database.complete_document_version(version, elements, chunks, products, activate=activate)
             return {
-                "document": {**version.model_dump(mode="json"), "status": "ready", "active": True},
+                "document": {**version.model_dump(mode="json"), "status": "ready", "active": activate},
                 "duplicate": False, "elements": len(elements), "chunks": len(chunks),
                 "products": len(products), "warnings": self._warnings(parsed),
             }

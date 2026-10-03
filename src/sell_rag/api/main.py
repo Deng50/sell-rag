@@ -60,19 +60,21 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
             return role
         return dependency
 
-    def rebuild_job(job_id: str) -> None:
+    def rebuild_job(job_id: str, changes: dict[str, int | None] | None = None) -> None:
         try:
             services.database.update_job(job_id, "running", 0.2, "正在构建隔离索引")
-            manifest = services.index.build()
+            manifest = services.index.build(changes)
             services.database.update_job(job_id, "complete", 1.0, json.dumps(manifest, ensure_ascii=False))
         except Exception as exc:
             services.database.update_job(job_id, "failed", 1.0, str(exc))
     def ingest_job(job_id: str, path: Path, source_id: str, owner: str, acl: list[Role]) -> None:
         try:
             services.database.update_job(job_id, "running", 0.1, "正在解析文档")
-            result = services.ingestion.ingest(path, source_id=source_id, owner=owner, acl=acl)
+            result = services.ingestion.ingest(path, source_id=source_id, owner=owner, acl=acl, activate=False)
             services.database.update_job(job_id, "running", 0.7, "正在更新索引")
-            manifest = services.index.build()
+            document = result["document"]
+            manifest = services.index.build({document["document_id"]: document["version"]})
+            document["active"] = True
             detail = {"ingestion": result, "index": manifest}
             services.database.update_job(job_id, "complete", 1.0, json.dumps(detail, ensure_ascii=False))
         except Exception as exc:
@@ -155,24 +157,22 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
     def activate(document_id: str, version: int, background: BackgroundTasks,
                  _: Annotated[Role, Depends(require(Role.ADMIN))]):
         try:
-            services.database.activate_version(document_id, version)
+            services.database.validate_version(document_id, version)
         except KeyError as exc:
             raise HTTPException(404, "文档版本不存在") from exc
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         job_id = services.database.create_job("reindex", f"activate {document_id}:{version}")
-        background.add_task(rebuild_job, job_id)
+        background.add_task(rebuild_job, job_id, {document_id: version})
         return {"job_id": job_id}
 
     @app.delete("/v1/documents/{document_id}", status_code=202)
     def delete_document(document_id: str, background: BackgroundTasks,
                         _: Annotated[Role, Depends(require(Role.ADMIN))]):
-        try:
-            services.database.soft_delete_document(document_id)
-        except KeyError as exc:
-            raise HTTPException(404, "文档不存在") from exc
+        if not any(row["document_id"] == document_id for row in services.database.list_documents()):
+            raise HTTPException(404, "文档不存在")
         job_id = services.database.create_job("reindex", f"delete {document_id}")
-        background.add_task(rebuild_job, job_id)
+        background.add_task(rebuild_job, job_id, {document_id: None})
         return {"job_id": job_id}
 
     @app.get("/v1/jobs/{job_id}")

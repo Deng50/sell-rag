@@ -20,6 +20,10 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
+class IndexConflictError(RuntimeError):
+    """Another process published a generation while this one was being built."""
+
+
 class Database:
     """SQLite source of truth. Every write is transactional and thread-safe per call."""
 
@@ -179,7 +183,7 @@ class Database:
 
     def complete_document_version(
         self, version: DocumentVersion, elements: Iterable[DocumentElement],
-        chunks: Iterable[Chunk], products: Iterable[Product],
+        chunks: Iterable[Chunk], products: Iterable[Product], *, activate: bool = True,
     ) -> None:
         with self.connect() as db:
             db.execute("DELETE FROM elements WHERE document_id=? AND document_version=?",
@@ -204,21 +208,29 @@ class Database:
                 db.execute("INSERT INTO product_versions VALUES(?,?,?,?)", (
                     version.document_id, version.version, product.sku, product.model_dump_json(),
                 ))
-            self._restore_products(db, version.document_id, version.version)
-            db.execute("UPDATE document_versions SET active=0 WHERE document_id=?", (version.document_id,))
             db.execute(
-                "UPDATE document_versions SET status='ready',active=1,error=NULL "
+                "UPDATE document_versions SET status='ready',error=NULL "
                 "WHERE document_id=? AND version=?", (version.document_id, version.version),
             )
-            db.execute("UPDATE documents SET deleted_at=NULL WHERE document_id=?", (version.document_id,))
+            if activate:
+                self._activate_version(db, version.document_id, version.version)
 
     @staticmethod
     def _restore_products(db: sqlite3.Connection, document_id: str, version: int) -> None:
-        db.execute("DELETE FROM products WHERE source_document_id=?", (document_id,))
-        for row in db.execute(
+        snapshots = db.execute(
             "SELECT payload_json FROM product_versions WHERE document_id=? AND document_version=?",
             (document_id, version),
-        ).fetchall():
+        ).fetchall()
+        expected = db.execute(
+            "SELECT COUNT(DISTINCT json_extract(payload_json,'$.metadata.sku')) FROM chunks "
+            "WHERE document_id=? AND document_version=? AND level='parent' "
+            "AND prompt_injection=0 AND json_extract(payload_json,'$.content_type')='product'",
+            (document_id, version),
+        ).fetchone()[0]
+        if expected > len(snapshots):
+            raise ValueError("历史版本缺少完整商品快照，请重新摄取源文件后再激活")
+        db.execute("DELETE FROM products WHERE source_document_id=?", (document_id,))
+        for row in snapshots:
             product = Product.model_validate_json(row[0])
             if db.execute("SELECT 1 FROM products WHERE sku=?", (product.sku,)).fetchone():
                 raise ValueError(f"SKU {product.sku} 已由其他文档或手工商品占用")
@@ -246,19 +258,28 @@ class Database:
 
     def activate_version(self, document_id: str, version: int) -> None:
         with self.connect() as db:
-            target = db.execute(
-                "SELECT status FROM document_versions WHERE document_id=? AND version=?",
-                (document_id, version),
-            ).fetchone()
-            if not target:
-                raise KeyError((document_id, version))
-            if target["status"] != "ready":
-                raise ValueError("Only a ready document version can be activated")
-            self._restore_products(db, document_id, version)
-            db.execute("UPDATE document_versions SET active=0 WHERE document_id=?", (document_id,))
-            db.execute("UPDATE document_versions SET active=1 WHERE document_id=? AND version=?",
-                       (document_id, version))
-            db.execute("UPDATE documents SET deleted_at=NULL WHERE document_id=?", (document_id,))
+            self._activate_version(db, document_id, version)
+
+    def validate_version(self, document_id: str, version: int) -> None:
+        with self.connect() as db:
+            self._validate_version(db, document_id, version)
+
+    @staticmethod
+    def _validate_version(db: sqlite3.Connection, document_id: str, version: int) -> None:
+        target = db.execute("SELECT status FROM document_versions WHERE document_id=? AND version=?",
+                            (document_id, version)).fetchone()
+        if not target:
+            raise KeyError((document_id, version))
+        if target["status"] != "ready":
+            raise ValueError("Only a ready document version can be activated")
+
+    def _activate_version(self, db: sqlite3.Connection, document_id: str, version: int) -> None:
+        self._validate_version(db, document_id, version)
+        self._restore_products(db, document_id, version)
+        db.execute("UPDATE document_versions SET active=0 WHERE document_id=?", (document_id,))
+        db.execute("UPDATE document_versions SET active=1 WHERE document_id=? AND version=?",
+                   (document_id, version))
+        db.execute("UPDATE documents SET deleted_at=NULL WHERE document_id=?", (document_id,))
 
     def soft_delete_document(self, document_id: str) -> None:
         with self.connect() as db:
@@ -268,7 +289,9 @@ class Database:
             db.execute("UPDATE document_versions SET active=0 WHERE document_id=?", (document_id,))
             db.execute("DELETE FROM products WHERE source_document_id=?", (document_id,))
 
-    def active_chunks(self, role: Role, *, children_only: bool = True) -> list[Chunk]:
+    def active_chunks(self, role: Role, *, children_only: bool = True,
+                      changes: dict[str, int | None] | None = None) -> list[Chunk]:
+        changes = changes or {}
         query = (
             "SELECT c.payload_json FROM chunks c JOIN document_versions v "
             "ON c.document_id=v.document_id AND c.document_version=v.version "
@@ -279,6 +302,16 @@ class Database:
             query += " AND c.level='child'"
         with self.connect() as db:
             rows = db.execute(query).fetchall()
+            rows = [row for row in rows
+                    if json.loads(row[0])["document_id"] not in changes]
+            for document_id, version in changes.items():
+                if version is not None:
+                    self._validate_version(db, document_id, version)
+                    rows.extend(db.execute(
+                        "SELECT payload_json FROM chunks WHERE document_id=? AND document_version=?"
+                        + (" AND level='child'" if children_only else ""),
+                        (document_id, version),
+                    ).fetchall())
         result = []
         for row in rows:
             chunk = Chunk.model_validate_json(row[0])
@@ -373,8 +406,22 @@ class Database:
             row = db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
         return dict(row) if row else None
 
-    def save_index_version(self, version: str, manifest: dict[str, Any], active: bool) -> None:
+    def save_index_version(self, version: str, manifest: dict[str, Any], active: bool,
+                           changes: dict[str, int | None] | None = None, *,
+                           expected_index: str | None = None, verify_current: bool = False) -> None:
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if verify_current:
+                current = db.execute("SELECT index_version FROM index_versions WHERE active=1").fetchone()
+                if (current[0] if current else None) != expected_index:
+                    raise IndexConflictError("索引构建期间有其他进程发布了更新")
+            for document_id, document_version in (changes or {}).items():
+                if document_version is None:
+                    db.execute("UPDATE documents SET deleted_at=? WHERE document_id=?", (_now(), document_id))
+                    db.execute("UPDATE document_versions SET active=0 WHERE document_id=?", (document_id,))
+                    db.execute("DELETE FROM products WHERE source_document_id=?", (document_id,))
+                else:
+                    self._activate_version(db, document_id, document_version)
             if active:
                 db.execute("UPDATE index_versions SET active=0")
             db.execute("INSERT OR REPLACE INTO index_versions VALUES(?,?,?,?,?)",

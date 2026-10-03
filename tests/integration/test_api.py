@@ -79,3 +79,15 @@ def test_speech_normalization_runs_at_api_boundary(services) -> None:
     result = client.post("/v1/speech/transcribe", files={"audio": ("a.pcm", b"hi")}).json()
     assert result["text"] == "hello world"
     assert result["needs_confirmation"] is True
+
+
+def test_failed_upload_index_leaves_previous_catalog_active(services, monkeypatch) -> None:
+    services.ingestion.ingest("tests/fixtures/products.csv", source_id="products.csv")
+    services.index.build()
+    monkeypatch.setattr(services.index, "build", lambda *args: (_ for _ in ()).throw(RuntimeError("offline")))
+    headers = {"X-Role": "operator", "Authorization": "Bearer operator-test"}
+    client = TestClient(create_app(services=services))
+    response = client.post("/v1/documents", headers=headers,
+                           files={"file": ("products.csv", b"sku,name,price,stock\nNEW,New,999,1")})
+    assert services.database.get_job(response.json()["job_id"])["status"] == "failed"
+    assert {p.sku for p in services.database.query_products()} == {"DRINK-001", "SNACK-001", "GIFT-001"}
