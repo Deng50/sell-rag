@@ -209,17 +209,25 @@ class DocumentParser:
 
     @staticmethod
     def _plain(path: Path) -> list[ParsedElement]:
-        result, section = [], []
-        for block in re.split(r"\n\s*\n", path.read_text(encoding="utf-8-sig", errors="replace")):
-            text = block.strip()
-            if not text:
-                continue
-            if re.match(r"^#{1,6}\s+", text):
-                title = re.sub(r"^#{1,6}\s+", "", text).strip()
-                section = [title]
+        result, section, paragraph = [], [], []
+
+        def flush() -> None:
+            if paragraph:
+                result.append(ParsedElement("text", text="\n".join(paragraph), section_path=list(section)))
+                paragraph.clear()
+
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            heading = re.match(r"^(#{1,6})\s+(.+)$", line)
+            if heading:
+                flush()
+                title = heading.group(2).strip()
+                section = section[:len(heading.group(1)) - 1] + [title]
                 result.append(ParsedElement("title", text=title, title=title, section_path=list(section)))
+            elif not line.strip():
+                flush()
             else:
-                result.append(ParsedElement("text", text=text, section_path=list(section)))
+                paragraph.append(line)
+        flush()
         return result
 
     def _xlsx(self, path: Path) -> tuple[list[ParsedElement], list[Product]]:
@@ -227,7 +235,18 @@ class DocumentParser:
         from openpyxl.utils import get_column_letter
 
         formulas = load_workbook(path, data_only=False)
-        values = load_workbook(path, data_only=True)
+        try:
+            values = load_workbook(path, data_only=True)
+            try:
+                return self._xlsx_workbooks(path, formulas, values)
+            finally:
+                values.close()
+        finally:
+            formulas.close()
+
+    def _xlsx_workbooks(self, path: Path, formulas, values) -> tuple[list[ParsedElement], list[Product]]:
+        from openpyxl.utils import get_column_letter
+
         elements, products = [], []
         for sheet_values in values.worksheets:
             sheet_formulas = formulas[sheet_values.title]
@@ -251,7 +270,7 @@ class DocumentParser:
                     headers.append(leaf if leaf in canonical else "/".join(values_for_header))
             table = [list(row) for row in rows[header_idx:] if any(x not in (None, "") for x in row)]
             end_col = get_column_letter(max(len(row) for row in table))
-            cell_range = f"A{header_idx + 1}:{end_col}{header_idx + len(table)}"
+            cell_range = f"A{header_idx + 1}:{end_col}{len(rows)}"
             elements.append(ParsedElement(
                 "table", text=self._table_markdown(table), table_json=table,
                 sheet_name=sheet_values.title, cell_range=cell_range,
@@ -279,25 +298,39 @@ class DocumentParser:
         return elements, products
 
     def _csv(self, path: Path) -> tuple[list[ParsedElement], list[Product]]:
-        products = []
+        products, elements = [], []
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            rows = list(csv.DictReader(handle))
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+            headers = reader.fieldnames or []
         for index, row in enumerate(rows, 2):
+            if None in row:
+                raise ValueError(f"CSV 第 {index} 行的列数超过表头")
             product = self._product({self._normalize_header(k): v for k, v in row.items()}, path, None, index, {})
             if product:
                 products.append(product)
-        return [ParsedElement("product", text=self._product_text(item), title=item.name,
-                              cell_range=f"row:{i + 2}", metadata={"sku": item.sku})
-                for i, item in enumerate(products)], products
+                elements.append(ParsedElement("product", text=self._product_text(product), title=product.name,
+                                              cell_range=f"row:{index}", metadata={"sku": product.sku}))
+        if not products and rows:
+            grid = [headers] + [[row.get(key) for key in headers] for row in rows]
+            elements.append(ParsedElement("table", text=self._table_markdown(grid), table_json=grid))
+        return elements, products
 
     def _json(self, path: Path) -> tuple[list[ParsedElement], list[Product]]:
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
-        rows = payload if isinstance(payload, list) else payload.get("products", [])
+        rows = payload if isinstance(payload, list) else payload.get("products", []) if isinstance(payload, dict) else []
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            if isinstance(payload, dict) and "products" in payload:
+                raise ValueError("JSON products 必须是对象数组")
+            rows = []
         products = [item for i, row in enumerate(rows, 1)
                     if (item := self._product({self._normalize_header(k): v for k, v in row.items()},
                                               path, None, i, {}))]
-        return [ParsedElement("product", text=self._product_text(item), title=item.name,
-                              metadata={"sku": item.sku}) for item in products], products
+        elements = [ParsedElement("product", text=self._product_text(item), title=item.name,
+                                  metadata={"sku": item.sku}) for item in products]
+        if not products:
+            elements = [ParsedElement("text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
+        return elements, products
 
     @staticmethod
     def _headers(row: Iterable[Any]) -> list[str]:
@@ -305,6 +338,7 @@ class DocumentParser:
 
     @staticmethod
     def _normalize_header(value: str) -> str:
+        value = value.strip()
         mapping = {
             "商品编号": "sku", "编号": "sku", "SKU": "sku", "商品名称": "name", "名称": "name",
             "类别": "category", "分类": "category", "单价": "price", "价格": "price",
@@ -319,17 +353,25 @@ class DocumentParser:
         if not name:
             return None
         sku = str(record.get("sku") or hashlib.sha256(f"{path.name}:{sheet}:{name}".encode()).hexdigest()[:12]).strip()
-        price_text = re.sub(r"[^0-9.-]", "", str(record.get("price") or "0")) or "0"
+        for key in ("price", "stock"):
+            if key in formulas and record.get(key) in (None, ""):
+                raise ValueError(f"第 {row} 行 {key} 公式没有缓存结果，请先在电子表格软件中重新计算并保存")
+        price_text = str(record.get("price") or "0").strip().replace(",", "")
+        price_text = price_text.lstrip("¥￥").removesuffix("元").strip()
         try:
             price = Decimal(price_text)
-        except InvalidOperation:
-            price = Decimal("0")
-        stock_text = re.search(r"\d+", str(record.get("stock") or "0"))
-        target = [x.strip() for x in re.split(r"[,，、;/]", str(record.get("target_group") or "")) if x.strip()]
+        except InvalidOperation as exc:
+            raise ValueError(f"第 {row} 行价格无效: {price_text}") from exc
+        stock_text = str(record.get("stock") or "0").strip()
+        if not re.fullmatch(r"\d+(?:\.0+)?", stock_text):
+            raise ValueError(f"第 {row} 行库存必须是非负整数: {stock_text}")
+        group = record.get("target_group") or []
+        target = ([str(x).strip() for x in group] if isinstance(group, list)
+                  else [x.strip() for x in re.split(r"[,，、;/]", str(group)) if x.strip()])
         active_value = str(record.get("active", "true")).lower()
         return Product(
             sku=sku, name=name, category=str(record.get("category") or "未分类"), price=price,
-            stock=int(stock_text.group()) if stock_text else 0, target_group=target,
+            stock=int(Decimal(stock_text)), target_group=target,
             description=str(record.get("description") or ""), active=active_value not in {"false", "0", "下架"},
             attributes={"source": path.name, "sheet_name": sheet, "row_id": row, "formulas": formulas},
         )
@@ -348,7 +390,11 @@ class DocumentParser:
         if not grid:
             return ""
         width = max(len(row) for row in grid)
-        rows = [[str(cell or "").replace("|", "\\|") for cell in row] + [""] * (width - len(row)) for row in grid]
+        def cell_text(cell: Any) -> str:
+            if isinstance(cell, dict):
+                cell = cell.get("text", "")
+            return str(cell if cell is not None else "").replace("|", "\\|")
+        rows = [[cell_text(cell) for cell in row] + [""] * (width - len(row)) for row in grid]
         return "\n".join([
             "| " + " | ".join(rows[0]) + " |",
             "| " + " | ".join(["---"] * width) + " |",
@@ -358,6 +404,8 @@ class DocumentParser:
 
 class ParentChildChunker:
     def __init__(self, child_tokens: int = 300, parent_tokens: int = 900, overlap_ratio: float = 0.12):
+        if child_tokens <= 0 or parent_tokens < child_tokens or not 0 <= overlap_ratio < 1:
+            raise ValueError("切片大小必须为正，父块不能小于子块，重叠比例必须在 [0,1) 内")
         self.child_tokens = child_tokens
         self.parent_tokens = parent_tokens
         self.overlap_ratio = overlap_ratio
@@ -384,7 +432,7 @@ class ParentChildChunker:
                     text=parent_text, content_hash=hashlib.sha256(parent_text.encode()).hexdigest(), **common,
                 ))
                 chunk_index += 1
-                overlap = max(1, int(self.child_tokens * self.overlap_ratio))
+                overlap = int(self.child_tokens * self.overlap_ratio)
                 for child_no, child_text in enumerate(self._windows(parent_text, self.child_tokens, overlap)):
                     child_id = self._id(document_id, version, parent_id, "c", child_no, child_text)
                     chunks.append(Chunk(
@@ -399,13 +447,13 @@ class ParentChildChunker:
         return re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9_.+-]+|[^\s]", text)
 
     def _windows(self, text: str, size: int, overlap: int) -> list[str]:
-        tokens = self._tokens(text)
+        tokens = list(re.finditer(r"[\u4e00-\u9fff]|[A-Za-z0-9_.+-]+|[^\s]", text))
         if len(tokens) <= size:
             return [text]
         result, start = [], 0
         while start < len(tokens):
             end = min(start + size, len(tokens))
-            result.append("".join(tokens[start:end]))
+            result.append(text[tokens[start].start():tokens[end - 1].end()])
             if end == len(tokens):
                 break
             start = max(start + 1, end - overlap)
@@ -475,6 +523,9 @@ class IngestionService:
                 product.source_document_id = version.document_id
                 product.source_document_version = version.version
                 product.acl = acl
+            products = [product for product in products
+                        if not any(pattern.search(self.parser._product_text(product))
+                                   for pattern in INJECTION_PATTERNS)]
             chunks = self.chunker.chunk(version.document_id, version.version, acl, elements)
             self.database.complete_document_version(version, elements, chunks, products)
             return {

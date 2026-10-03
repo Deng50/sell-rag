@@ -81,8 +81,8 @@ class Chunk(BaseModel):
 
 
 class Product(BaseModel):
-    sku: str
-    name: str
+    sku: str = Field(min_length=1)
+    name: str = Field(min_length=1)
     category: str = "未分类"
     price: Decimal = Decimal("0.00")
     stock: int = 0
@@ -95,11 +95,16 @@ class Product(BaseModel):
     updated_at: datetime = Field(default_factory=utc_now)
     attributes: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("sku", "name", mode="before")
+    @classmethod
+    def strip_identifier(cls, value: str) -> str:
+        return value.strip() if isinstance(value, str) else value
+
     @field_validator("price")
     @classmethod
     def non_negative_price(cls, value: Decimal) -> Decimal:
-        if value < 0:
-            raise ValueError("price must be non-negative")
+        if not value.is_finite() or not Decimal("0") <= value <= Decimal("92233720368547758.07"):
+            raise ValueError("price must be finite, non-negative and fit in SQLite cents")
         return value.quantize(Decimal("0.01"))
 
     @field_validator("stock")
@@ -114,6 +119,11 @@ class QueryRequest(BaseModel):
     query: str = Field(min_length=1, max_length=2000)
     role: Role = Role.GUEST
     session_id: str | None = None
+
+    @field_validator("query", mode="before")
+    @classmethod
+    def strip_query(cls, value: str) -> str:
+        return value.strip() if isinstance(value, str) else value
 
 
 class SearchHit(BaseModel):
