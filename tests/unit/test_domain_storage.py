@@ -134,3 +134,16 @@ def test_old_incomplete_product_snapshot_requires_reingestion(services, tmp_path
     upgraded = services.ingestion.ingest(source)
     assert upgraded["document"]["version"] == 2
     assert services.database.query_products()[0].price == Decimal("2")
+
+
+def test_reopening_database_after_acl_version_change_preserves_versions(services, tmp_path) -> None:
+    from sell_rag.storage import Database
+
+    source = tmp_path / "reopen.md"
+    source.write_text("同一文件不同访问策略", encoding="utf-8")
+    services.ingestion.ingest(source)
+    services.ingestion.ingest(source, acl=[Role.ADMIN])
+    reopened = Database(services.settings.database)
+    assert len(reopened.list_documents()) == 2
+    assert reopened.active_chunks(Role.GUEST) == []
+    assert reopened.active_chunks(Role.ADMIN)

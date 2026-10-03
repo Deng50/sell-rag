@@ -62,8 +62,6 @@ class Database:
                     error TEXT, stored_path TEXT, PRIMARY KEY(document_id, version),
                     FOREIGN KEY(document_id) REFERENCES documents(document_id)
                 );
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_version_hash
-                    ON document_versions(document_id, sha256);
                 CREATE TABLE IF NOT EXISTS elements (
                     element_id TEXT PRIMARY KEY, document_id TEXT NOT NULL,
                     document_version INTEGER NOT NULL, element_order INTEGER NOT NULL,
