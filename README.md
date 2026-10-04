@@ -1,207 +1,187 @@
-# Sell-RAG
+# Sell-RAG：多模态售卖终端知识助手
 
-面向单机智能售卖终端的多模态检索增强生成系统。项目将文档版本管理、结构化商品库、混合检索、有引用回答、语音交互和人员存在检测拆分为独立服务，并提供 FastAPI、CLI 与 PyQt 双视图客户端。
+面向本地智能售卖终端的检索增强问答系统。导入商品表格、校史资料和服务说明后，可进行带引用的知识问答、精确价格/库存查询和预算推荐；同时提供 HTTP API、命令行和 PyQt 桌面客户端。
 
-> 默认以 Fake 模式运行，不需要 API 密钥或大型模型即可完成开发、演示和自动化测试。生产模式使用智谱生成/视觉、百度 ASR/TTS、本地 BGE Embedding 与 Cross-Encoder。
+**可以先用默认 Fake 模式离线体验。** 核心流程无需云端密钥或大型模型；真实语义模型、语音、OCR 和摄像头能力需按需安装依赖并配置服务或设备。
 
-## Architecture
+## 功能概况
 
-```mermaid
-flowchart LR
-    subgraph Offline[离线链路]
-        A[PDF/DOCX/XLSX/图片] --> B[校验与版本管理]
-        B --> C[Docling/OCR/结构化解析]
-        C --> D[父子切片与商品记录]
-        D --> E[角色隔离索引]
-        E --> F[(SQLite + FAISS)]
-    end
-    subgraph Online[在线链路]
-        G[文本/语音] --> H[查询路由与字段提取]
-        H --> I[SQLite精确查询]
-        H --> J[Dense + BM25]
-        J --> K[RRF + Cross-Encoder]
-        I --> L[证据组装]
-        K --> L
-        L --> M[有引用回答/拒答]
-        M --> N[流式界面与TTS]
-    end
-```
+| 能力 | 当前实现 |
+| --- | --- |
+| 文档接入 | 文本、Markdown、CSV、JSON、XLSX；PDF、DOCX、扫描件和图片按解析依赖启用，保留章节、页码和表格元数据 |
+| 商品查询 | SQLite 保存 SKU、名称、价格和库存；支持精确识别、预算筛选和缺货信息 |
+| 知识问答 | 按角色检索、证据组装、引用校验、缺少依据时拒答；真实模式可使用 BGE、BM25、RRF 与 Cross-Encoder |
+| 版本管理 | 内容去重、商品快照、历史激活、软删除；文档、商品与索引在构建成功后共同发布 |
+| 权限隔离 | `guest`、`operator`、`admin` 角色及文档/商品 ACL；检索时核验版本和权限有效性 |
+| 桌面交互 | 问答与知识库管理双视图，SSE 答案显示、上传任务轮询、后台线程取消与关闭管理 |
+| 多模态 | 百度 ASR/TTS、语音活动检测、热词纠错、低置信确认、分句播放与打断；可选人员存在检测 |
+| 评测诊断 | 检索、引用、拒答、解析、延迟评测，健康与就绪接口 |
 
-离线摄取在新索引验证完成后原子切换，因此上传或回滚文档不会让在线问答读取半成品索引。
+### 2026-10-04 完善内容
 
-## Features
+- 商品回滚、删除与索引发布保持一致；索引失败继续使用旧知识，支持跨进程刷新和发布冲突检测。
+- 修复同名商品/SKU 混淆、预算绕过、价格精度和超大预算溢出。
+- 修复文本切片、CSV/JSON、DOCX/Docling 阅读顺序，校验非法商品数字和未计算的 Excel 公式。
+- 完善上传文件身份、SSE 换行、语音队列隔离、界面线程与任务状态反馈。
+- 修正重复文档和无标注数据导致的评测分数虚高。详见 [程序审查报告](docs/audit-2026-10-04.md)。
 
-- PDF、扫描 PDF、DOCX、XLSX、CSV、JSON、Markdown、文本和图片接入。
-- 文件签名、大小、压缩规模与路径安全检查，SHA-256 去重和增量版本管理。
-- Docling 优先解析，保留页码、版面、表格和图片元数据；轻量环境自动使用显式回退解析器。
-- XLSX 商品行进入 SQLite，价格、库存和 SKU 不依赖向量相似度判断。
-- 300/900 Token 父子切片，12% 子块重叠，不跨越商品、章节或表格边界。
-- BGE Dense + 中文 BM25 + RRF + Cross-Encoder；模型不可用时降级但不会伪造健康状态。
-- `guest`、`operator`、`admin` 角色隔离，文档和结构化商品均执行 ACL。
-- 引用白名单校验、无证据拒答、未知商品拒答和提示注入内容隔离。
-- 百度 ASR/TTS、WebRTC VAD、热词纠错、低置信确认、分句播放和 barge-in。
-- 摄像头仅检测人员是否出现；5/8 帧防抖和 30 秒冷却，不保存画面，不推断身份或人口属性。
-- 内置检索、引用、拒答、解析和延迟评测指标。
+## 快速开始：离线文字问答
 
-## Project Layout
+要求 **Python 3.11 或 3.12**，主要运行与验证平台为 Windows。以下命令使用 **Windows PowerShell**，在仓库根目录执行，直接调用虚拟环境程序，无需激活脚本。
 
-```text
-configs/default.yaml          运行参数，不保存密钥
-src/sell_rag/
-├── domain/                   Pydantic 数据契约
-├── ingestion/                校验、解析、切片与版本摄取
-├── storage/                  SQLite 数据层
-├── indexing/                 Embedding、FAISS、BM25 和索引版本
-├── retrieval/                路由、过滤、RRF、重排和证据组装
-├── generation/               智谱/Fake 适配器与引用回答
-├── multimodal/               百度语音、VAD、TTS 和人员存在检测
-├── api/                      FastAPI 工厂与版本化接口
-├── ui/                       PyQt 用户/管理双视图
-├── evaluation/               离线回归评测
-├── observability/            JSON 日志与耗时追踪
-├── settings.py
-└── cli.py
-tests/                        单元、集成、夹具与评测数据
-runtime/                      文档、SQLite、索引和日志；不提交 Git
-```
-
-## Requirements
-
-- Windows 10/11
-- Python 3.11
-- 完整终端功能需要摄像头和麦克风
-- BGE 与 Reranker 使用 GPU 时建议 NVIDIA GPU 及匹配的 PyTorch/CUDA
-
-## Installation
+### 1. 安装核心依赖
 
 ```powershell
 git clone https://github.com/Deng50/sell-rag.git
 cd sell-rag
-
-py -3.11 -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -e .
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.lock
+.\.venv\Scripts\python.exe -m pip install -e . --no-deps
 ```
 
-按需安装可选能力：
+已有仓库时跳过克隆；使用 Python 3.11 时，将创建环境命令中的 `-3.12` 改为 `-3.11`。
+
+### 2. 导入自带示例
 
 ```powershell
-pip install -e ".[document,retrieval]"  # Docling、OCR、BGE、FAISS、重排
-pip install -e ".[audio,vision,ui]"     # 语音、摄像头、PyQt
-pip install -e ".[dev,eval]"            # 测试和评测
+$env:SELL_RAG_FAKE_PROVIDERS = "true"
+.\.venv\Scripts\sell-rag.exe ingest .\tests\fixtures\products.csv
+.\.venv\Scripts\sell-rag.exe ingest .\tests\fixtures\knowledge.md
 ```
 
-核心依赖的可复现版本位于 `requirements.lock`：
+命令会创建本地 `runtime/` 数据、解析文件并发布索引。示例商品包含清泉饮用水、每日坚果和校园纪念杯，知识文件包含校史和售卖说明。
+
+### 3. 启动服务并提问
 
 ```powershell
-pip install -r requirements.lock
-pip install -e . --no-deps
+.\.venv\Scripts\sell-rag.exe serve
 ```
 
-PyTorch 应根据设备从官方渠道安装匹配的 CPU 或 CUDA wheel，不在锁文件中强制单一 CUDA 版本。
+打开 [API 文档](http://127.0.0.1:8765/docs)，在 `POST /v1/query` 中输入：
 
-## Configuration
+```json
+{"query": "清泉饮用水多少钱？"}
+```
 
-运行参数位于 `configs/default.yaml`，密钥只从环境变量读取：
+也可在另一个 PowerShell 终端调用接口：
 
 ```powershell
-$env:SELL_RAG_FAKE_PROVIDERS="true"
-$env:SELL_RAG_ADMIN_TOKEN="请设置高强度管理员令牌"
-$env:SELL_RAG_OPERATOR_TOKEN="请设置操作员令牌"
+$body = @{ query = "清泉饮用水多少钱？" } | ConvertTo-Json
+Invoke-RestMethod -Uri "http://127.0.0.1:8765/v1/query" -Method Post -ContentType "application/json; charset=utf-8" -Body ([System.Text.Encoding]::UTF8.GetBytes($body))
 ```
 
-启用真实服务：
+可以继续尝试“校园纪念杯还有库存吗？”或“北洋大学堂是什么时候创建的？”。Fake 模式用于验证流程和结构化数据，不能代表真实模型的语言理解与回答质量。
+
+## 桌面客户端与可选能力
+
+服务保持运行，另开终端进入同一仓库：
 
 ```powershell
-$env:SELL_RAG_FAKE_PROVIDERS="false"
-$env:ZHIPUAI_API_KEY="你的智谱 API Key"
-$env:BAIDU_API_KEY="你的百度语音 API Key"
-$env:BAIDU_SECRET_KEY="你的百度语音 Secret Key"
-$env:SELL_RAG_DEVICE="cuda"
+.\.venv\Scripts\python.exe -m pip install -e ".[ui]"
+.\.venv\Scripts\sell-rag.exe ui
 ```
 
-## Quick Start
+用户视图用于问答；知识库管理视图可上传文档并查看处理结果。管理操作需要令牌，服务端与界面进程应配置相同的 `SELL_RAG_OPERATOR_TOKEN`。语音、摄像头需另装对应依赖。
 
-启动本地服务：
-
-```powershell
-sell-rag serve
-```
-
-访问 API 文档：<http://127.0.0.1:8765/docs>
-
-另开终端启动 PyQt 客户端：
-
-```powershell
-sell-rag ui
-```
-
-摄取文档并原子重建索引：
-
-```powershell
-sell-rag ingest .\data\商品目录.xlsx
-sell-rag ingest .\data\校史资料.pdf --acl guest,operator,admin
-```
-
-常用管理命令：
-
-```powershell
-sell-rag reindex
-sell-rag rollback DOCUMENT_ID VERSION
-sell-rag migrate-legacy .\zhipuai_rag\dataset\chroma_db
-sell-rag evaluate .\tests\fixtures\evaluation.jsonl
-```
-
-## API
-
-| Method | Endpoint | Description |
+| 依赖组 | 安装命令 | 用途 |
 | --- | --- | --- |
-| `POST` | `/v1/query` | 同步结构化问答 |
-| `POST` | `/v1/query/stream` | SSE 回答、引用与完成事件 |
-| `POST` | `/v1/documents` | 上传并异步解析、索引 |
-| `GET` | `/v1/documents` | 文档版本、ACL 和状态 |
-| `POST` | `/v1/documents/{id}/versions/{version}/activate` | 激活历史版本 |
-| `DELETE` | `/v1/documents/{id}` | 软删除并更新索引 |
-| `GET` | `/v1/jobs/{id}` | 后台任务状态 |
-| `GET/POST` | `/v1/products` | 商品精确查询与维护 |
-| `POST` | `/v1/speech/transcribe` | PCM 语音识别 |
-| `POST` | `/v1/speech/synthesize` | WAV 语音合成 |
-| `POST` | `/v1/feedback` | 用户反馈 |
-| `POST` | `/v1/evaluations` | 运行回归评测 |
-| `GET` | `/health`, `/ready` | 依赖状态与就绪检查 |
+| 文档 | `.\.venv\Scripts\python.exe -m pip install -e ".[document]"` | Docling、PDF、DOCX；完整 OCR 可能还需模型资源 |
+| 检索 | `.\.venv\Scripts\python.exe -m pip install -e ".[retrieval]"` | BGE、Cross-Encoder、FAISS、PyTorch |
+| 音频 | `.\.venv\Scripts\python.exe -m pip install -e ".[audio]"` | 录音、VAD、播放 |
+| 视觉 | `.\.venv\Scripts\python.exe -m pip install -e ".[vision]"` | 摄像头与人员检测 |
+| 开发 | `.\.venv\Scripts\python.exe -m pip install -e ".[dev]"` | 测试、覆盖率与静态检查 |
 
-管理请求需要角色和令牌：
+真实模型首次使用可能下载权重，GPU 运行需匹配的 PyTorch/CUDA。可选依赖不由核心 `requirements.lock` 完整锁定。
+
+## 配置与真实服务
+
+参数在 [configs/default.yaml](configs/default.yaml)，密钥和开关从**进程环境变量**读取。当前程序不会自动加载根目录 `.env`；[.env.example](.env.example) 仅为变量参考。
+
+```powershell
+$env:SELL_RAG_OPERATOR_TOKEN = "替换为你的操作员令牌"
+$env:SELL_RAG_ADMIN_TOKEN = "替换为你的管理员令牌"
+```
+
+启用真实适配器时，在服务启动前配置：
+
+```powershell
+$env:SELL_RAG_FAKE_PROVIDERS = "false"
+$env:ZHIPUAI_API_KEY = "填写你的智谱密钥"
+$env:BAIDU_API_KEY = "填写你的百度语音密钥"
+$env:BAIDU_SECRET_KEY = "填写你的百度语音密钥"
+$env:SELL_RAG_DEVICE = "cpu"
+```
+
+准备好 GPU 后可改为 `cuda`。可用 `SELL_RAG_CONFIG` 指定其他 YAML 文件。各终端从同一仓库根目录启动，避免相对路径产生不同数据目录。
+
+## 导入与管理自己的知识
+
+```powershell
+.\.venv\Scripts\sell-rag.exe ingest .\data\商品目录.xlsx
+.\.venv\Scripts\sell-rag.exe ingest .\data\内部说明.pdf --acl operator,admin
+.\.venv\Scripts\sell-rag.exe reindex
+.\.venv\Scripts\sell-rag.exe rollback DOCUMENT_ID VERSION
+```
+
+替换上述文件路径和版本参数为实际值。CLI 是本机管理入口；HTTP 管理接口需要认证。商品表可参照 [示例 CSV](tests/fixtures/products.csv)，包含编号、名称、价格、库存等字段。库存不能为负数或小数，Excel 公式须先计算并保存结果。
+
+上传接口返回任务编号，通过 `/v1/jobs/{job_id}` 查看结果。需要发布一致性时使用 CLI/API 管理流程。旧数据库从未保存的商品历史不能凭空恢复，缺少快照时须重新摄取相应原始文件。
+
+## 常用接口
+
+| 接口 | 用途 |
+| --- | --- |
+| `POST /v1/query`、`POST /v1/query/stream` | 同步问答 / SSE 回答、引用和完成事件 |
+| `POST /v1/documents`、`GET /v1/documents` | 上传与查询文档 |
+| `POST /v1/documents/{document_id}/versions/{version}/activate` | 激活历史版本 |
+| `DELETE /v1/documents/{document_id}` | 软删除并更新索引 |
+| `GET /v1/jobs/{job_id}` | 查询后台任务 |
+| `GET /v1/products`、`POST /v1/products` | 商品查询与维护 |
+| `POST /v1/speech/transcribe`、`POST /v1/speech/synthesize` | 语音识别与合成 |
+| `POST /v1/feedback`、`POST /v1/evaluations` | 反馈与评测 |
+| `GET /health`、`GET /ready` | 健康与就绪检查 |
+
+管理请求附带 `X-Role: operator` 或 `admin`，以及对应的 `Authorization: Bearer <令牌>`。请求体角色不能代替认证；普通用户默认为 `guest`。字段和具体权限以运行后的 `/docs` 为准。
+
+## 架构与目录
 
 ```text
-X-Role: operator
-Authorization: Bearer <SELL_RAG_OPERATOR_TOKEN>
+文件 → 校验/解析 → 切片与商品快照 → 构建索引 → 共同发布
+问题 → 查询路由 → SQLite / 角色隔离检索 → 证据与引用 → 回答
+
+configs/                       默认参数
+src/sell_rag/ingestion/         文档校验、解析和切片
+src/sell_rag/storage/           SQLite、版本和商品快照
+src/sell_rag/indexing/          模型适配与索引发布
+src/sell_rag/retrieval/         商品路由、检索和重排
+src/sell_rag/generation/        生成与引用回答
+src/sell_rag/multimodal/        语音和人员检测
+src/sell_rag/api/、ui/          HTTP 与桌面入口
+src/sell_rag/evaluation/        本地评测
+tests/                         测试和示例文件
+runtime/                       本地数据库、文档、索引和日志
 ```
 
-请求体中的角色不会用于提权，服务只信任认证头解析出的角色。
-
-## Testing
+## 测试与当前边界
 
 ```powershell
-pytest
+.\.venv\Scripts\python.exe -m pip install -e ".[dev,ui]" python-docx pypdf
+$env:QT_QPA_PLATFORM = "offscreen"
+.\.venv\Scripts\python.exe -m pytest --cov=sell_rag --cov-report=term
+.\.venv\Scripts\python.exe -m ruff check --isolated --select E9,F63,F7,F82 src tests
+.\.venv\Scripts\sell-rag.exe evaluate .\tests\fixtures\evaluation.jsonl
 ```
 
-默认测试不访问云 API，也不下载模型。`live` 标记专用于真实服务和模型验证。内置评测集仅用于回归，不能代表真实业务准确率；生产指标必须基于人工标注数据报告。
+2026-10-04 审查时 **60 项测试通过，语句覆盖率 78%**。默认测试不访问云 API 或下载大型模型；云服务、完整 OCR、GPU、摄像头和麦克风仍需实机验收。
 
-2026-10-04 的逐模块审查、修复提交和验证边界见 [程序审查记录](docs/audit-2026-10-04.md)。
+- SSE 发送引用校验后的分段答案，首段需等待生成完成，不是上游模型首 token 即时输出。
+- Fake TTS 返回有效静音 WAV，实际朗读需要百度语音服务。
+- 缺少人工相关性标注的评测指标返回 `null`。API 评测文件限于 `tests/fixtures/` 或 `runtime/evaluations/`。
+- 摄像头只检测人员是否出现，画面不持久化，不推断身份、年龄或性别。
+- 管理接口 401 时，检查令牌配置、角色和认证头是否一致。
+- `runtime/`、密钥和模型不提交 Git，业务数据需要单独备份。
 
-API 评测文件需位于 `tests/fixtures/` 或 `runtime/evaluations/`；CLI 可指定其他本地路径。没有相关文档标注的评测用例不纳入检索指标，未测指标返回 `null`。Fake TTS 返回有效静音 WAV，实际朗读需要百度语音配置。SSE 发送经过引用校验的分段答案，首段需等待生成完成。
+## 许可证
 
-旧数据库缺失的商品历史快照不能自动还原；缺少完整快照时回滚会明确报错，可重新摄取对应的原始历史文件。新版本会完整保存快照，并在索引构建成功后共同激活文档、商品和索引。
-
-## Security And Privacy
-
-- `runtime/`、模型、索引、音频、图片和 `.env` 均被 Git 忽略。
-- 疑似提示注入内容保留供管理员复核，但默认不进入检索索引。
-- 摄像头帧只在内存中处理，不做持久化、人脸识别、年龄、性别或情绪推断。
-- 如果密钥曾经进入 Git 历史，应先撤销密钥，再使用历史清理工具处理；删除当前源码中的字符串并不足够。
-- 正式部署应使用高强度令牌、限制本机端口访问并保护 `runtime/` 目录权限。
-
-## License
-
-当前仓库尚未提供开源许可证。在作者明确添加许可证前，请勿假定代码可被复制、修改或用于商业分发。
+当前仓库未提供独立开源许可证文件；使用和分发前请与作者确认授权范围。
